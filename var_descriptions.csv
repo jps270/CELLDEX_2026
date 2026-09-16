@@ -1,0 +1,51 @@
+var,name
+crp_pc_use,Cropland % upstream
+for_pc_use,Forest area % upstream 
+log10pop_ct_usu,Human population count upstream
+ire_pc_use,Irigated area % upstream
+kar_pc_use,Karst area % upstream
+log10lka_pc_use,Lake area % upstream
+log10lkv_mc_usu,Lake volume upstream (m cubic m)
+log10inu_pc_umx,Maximum % inundation upstream
+tmp_dc_smx,Maximum annual temperature (deg C)
+AETmonth,Mean AET month of deployment (mm)
+snw_pc_uyr,Mean annual % snow cover upstream
+swc_pc_uyr,Mean annual % soil water content upstream
+aet_mm_uyr,Mean annual AET upstream (mm)
+pre_mm_uyr,Mean annual precipitation upstream (mm)
+tmp_dc_uyr,Mean annual temperature upstream (deg C)
+log10ero_kh_uav,Mean erosion upstream (kg/ha/yr)
+mean_mean_daily_temp_rip,Mean measured AIR temp (deg C)
+mean_mean_daily_temp_str,Mean measured STREAM temp (deg C)
+log10ppd_pk_uav,Mean population density 
+log10precipmonth,Mean precipitation month of deployment (mm)
+run_mm_syr,Mean runoff subwatershed (mm)
+slp_dg_uav,Mean slope upstream (deg)
+clay,Site mean soil % clay 0-5 cm
+cly_pc_uav,Mean soil clay % upstream
+soc_th_uav,Mean soil organic C upstream (metric tons/ha)
+snd_pc_uav,Mean soil sand % upstream
+slt_pc_uav,Mean soil silt % upstream
+tempmonth,Mean temperature during month of deployment (deg C)
+log10riv_tc_usu,River volume upstream (1000 cubic m)
+log10rdd_mk_uav,Road density upstream (m/km)
+log10DRPc,Site DRP yield (kg/ha/yr)
+elev,Site elevation (m)
+slope,Site mean slope (deg)
+sand,Site mean soil % sand 0-5 cm
+silt,Site mean soil % silt 0-5 cm
+ocd,Site mean soil organic C density (kg/cubic m)
+sphw,Site mean soil pH (water) 0-5 cm
+log10NO3c,Site NO2-NO3 yield (kg/ha/yr)
+pst_pc_use,Site soil clay % upstream
+tpi,Site topographic position index
+log10TNdep,Site total N deposition (kg/ha/yr)
+tns,Site total soil N  0-5 cm (g/kg)
+snowmonth,Snow cover % month of deployment
+soilwatermonth,Soil water % month of deployment
+log10sgr_dk_sav,Stream gradient (dm/km)
+urb_pc_use,Urban % upstream
+wet_pc_ug1,Wetland % upstream
+log10Total.Soil.P,Site soil total P (g/m2)
+log10TN2TP,Site total annual N :P deposition ratio
+log10TPdep,Site total P deposition (kg/ha/yr)
