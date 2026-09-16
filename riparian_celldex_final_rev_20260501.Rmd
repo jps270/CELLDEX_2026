@@ -1,0 +1,1845 @@
+---
+title: "Riparian final"
+author: "JP Schmidt, Krista Capps"
+date: "2026-05-01"
+output: html_document
+---
+
+Load packages and set random seed.
+
+```{r}
+library(sp)
+library(raster)
+library(geodata)
+library(fields)
+library(sf)
+library(caret)
+library(gbm)
+library(pdp)
+library(gridExtra)
+library(grid)
+library(fasterize)
+library(parallel)
+library(ggplot2)
+library(png)
+library(cowplot)
+library(leaflet)
+library(Hmisc)
+library(caret)
+library(Metrics)
+library(viridis)
+library(vivid)
+library(alookr)
+library(caret)
+library(geodata)
+library(elevatr)
+library(patchwork)
+library(ncdf4)
+library(png) 
+library(rmatio)
+library(Rcompadre)
+library(terra)
+load("ripstr_rev.Rdata")
+set.seed(15)
+```
+
+#####DATA COLLATION######
+Retrieve CELLDEX data from GitHub.
+SOURCE: Tiegs et al. 2019 https://doi.org/10.1126/sciadv.aav0486
+DATA REPOSITORY: https://github.com/dmcostello/CELLDEX2018 
+DATA DOI: https://doi.org/10.5281/zenodo.2591572
+
+```{r}
+# Site characteristics
+CELLDEXsites <- read.csv("https://raw.githubusercontent.com/dmcostello/CELLDEX2018/edddf5a9477585cbbcb8280e686fc8a6000a29e8/CELLDEX_SITE_DATA.csv")
+CELLDEXsites$part.str <- paste(CELLDEXsites$partnerid,CELLDEXsites$stream)
+
+# Temperature during deployment
+tempdata <- read.csv("https://raw.githubusercontent.com/dmcostello/CELLDEX2018/edddf5a9477585cbbcb8280e686fc8a6000a29e8/CELLDEX_TEMPERATURE.csv")
+tempdata$part.str <- paste(tempdata$partnerid,tempdata$stream)
+tempdata2 <- aggregate(tempdata[,'mean_mean_daily_temp'],list(tempdata$part.str,tempdata$habitat),mean)
+colnames(tempdata2)[1:3] <- c("part.str","habitat","mean_mean_daily_temp")
+strtemp <- subset(tempdata2,habitat=="STR") # subset to stream data
+riptemp <- subset(tempdata2,habitat=="RIP") # subset to riparian data
+
+# Cotton decay rate
+CELLDEXkdR <- read.csv("https://raw.githubusercontent.com/dmcostello/CELLDEX2018/edddf5a9477585cbbcb8280e686fc8a6000a29e8/rip_k.csv")
+CELLDEXkdR$logk <- log(CELLDEXkdR$k)
+
+CELLDEXkdS <- read.csv("https://raw.githubusercontent.com/dmcostello/CELLDEX2018/edddf5a9477585cbbcb8280e686fc8a6000a29e8/str_k.csv")
+CELLDEXkdS$logk <- log(CELLDEXkdS$k)
+
+# Bring in deployment dates by CELLDEX location
+dates<-read.csv("CELLDEX_deploy_dates.csv")
+dates$part.str <- paste(dates$partnerid,dates$stream)
+dates$deploy_date <- as.Date(dates$deploy_date,format="%m/%d/%y")
+dates$month <- format(dates$deploy_date,"%m")
+
+# Merge CELLDEX datasets for STREAMS
+mer1 <- merge(CELLDEXkdS,strtemp[,c('part.str','mean_mean_daily_temp')], by='part.str',all.x=T)
+mer2 <- merge(mer1,dates[,c('deploy_date','part.str','month')],by='part.str',all.y=F)
+CELLDEX_STR <- merge(mer2,CELLDEXsites[,c('latitude','longitude','part.str',"biome_short")], by='part.str',all.y=F)
+colnames(CELLDEX_STR)[5] <- "mean_mean_daily_temp_str"
+
+# Merge CELLDEX datasets for RIPARIAN
+mer1 <- merge(CELLDEXkdR,riptemp[,c('part.str','mean_mean_daily_temp')], by='part.str',all.x=T)
+mer2 <- merge(mer1,dates[,c('deploy_date','part.str','month')],by='part.str',all.y=F)
+CELLDEX_RIP <- merge(mer2,CELLDEXsites[,c('latitude','longitude','part.str',"biome_short")], by='part.str',all.y=F)
+colnames(CELLDEX_RIP)[5] <- "mean_mean_daily_temp_rip"
+rm(mer1)
+rm(mer2)
+
+# Merge stream and riparian datasets to take difference
+CELLDEX_DR <- merge(CELLDEX_STR[,c(1,3)], CELLDEX_RIP[,c(1,3,5)], by = "part.str")
+colnames(CELLDEX_DR)[2] <- "k_str"
+colnames(CELLDEX_DR)[3] <- "k_rip"
+CELLDEX_DR$diff <- CELLDEX_DR$k_str - CELLDEX_DR$k_rip
+```
+
+Turn CELLDEX stream and riparian locations and data into separate spatial points data frames.
+
+```{r}
+Spts<-SpatialPointsDataFrame(CELLDEX_STR[,c('longitude','latitude')], CELLDEX_STR, proj4string=CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+Rpts<-SpatialPointsDataFrame(CELLDEX_RIP[,c('longitude','latitude')], CELLDEX_RIP, proj4string=CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+```
+
+Bring in stream NOx and DRP raster data 
+SOURCE: McDowell et al. (2021) https://doi.org/10.1002/gdj3.111
+DATA REPOSITORY: https://doi.org/10.25400/lincolnuninz.11894697 (rasters provided by corr. author)
+UNITS: kg (NO3-N or DRP-P)/ha/yr
+RESOLUTION: ~3 km
+
+The units of concentration are µg m−3 in the NZWQ database, µmol L−1 in the GLORICH database, and mg L−1 in the Murray-Darling and GEMS databases. We converted µmol L−1 into mg L−1 by multiplying the GLORICH data for N and P by 0.014007 and 0.030974, respectively. 
+
+```{r}
+NO3<-raster::raster("NO3_Conc.tif")
+DRP<-raster::raster("DRP_Conc.tif")
+```
+
+Bring in topographic data 
+SOURCE: Amatulli, G., Domisch, S., Tuanmu, M.-N., Parmentier, B., Ranipeta, A., Malczyk, J., and Jetz, W. (2018) A suite of global, cross-scale topographic variables for environmental and biodiversity modeling. Scientific Data volume 5, Article number: 180040. DOI: doi:10.1038/sdata.2018.40.
+DATA REPOSITORY: https://www.earthenv.org/topography 
+UNITS: 
+TPI = Focal Cell Elevation - Mean Elevation of Neighborhood 
+slope = degrees
+elevation = m
+SUMMARY: mean
+RESOLUTION: 1 km
+
+```{r}
+# Topographic
+tpi <- raster("tpi_1KMmn_GMTEDmd.tif") # topographic position index
+crs(tpi) <- crs(Spts)
+slope <- raster("slope_1KMmn_GMTEDmd.tif")
+crs(slope) <- crs(Spts)
+elev <- raster("elevation_1KMmn_GMTEDmn.tif")
+crs(elev) <- crs(Spts)
+```
+
+Bring in rasters of mean values for soil properties in the upper 5 cm of the soil profile at 30 second resolution globally 
+SOURCE: Poggio L., de Sousa L.M., Batjes N.H., Heuvelink G.B.M., Kempen B., Ribeiro E., Rossiter D., 2021. SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty. Soil 7:217-240, 2021. doi:10.5194/soil-7-217-2021
+DATA REPOSITORY: https://www.isric.org/explore/soilgrids via the geodata package
+UNITS: 
+clay, silt and sand = % 
+SOC density (OCD) = dg/kg
+pH (water) = log10(H+ activity), 0-14 scale
+total N (TNS) = cg/kg
+RESOLUTION: 1 km
+
+```{r}
+# path <- getwd()
+# clay <- soil_world(var = "clay", depth = 5, path = path)
+# silt <- soil_world(var = "silt", depth = 5, path = path)
+# sand <- soil_world(var = "sand", depth = 5, path = path)
+# ocd <- soil_world(var = "ocd", depth = 5, path = path)
+# sphw <- soil_world(var = "phh2o", depth = 5, path = path)
+# tns <- soil_world(var = "nitrogen", depth = 5, path = path)
+
+# Convert soil grids to rasters from spatrasters
+clay <- raster("clay_0-5cm_mean_30s.tif")
+silt <- raster("silt_0-5cm_mean_30s.tif")
+sand <- raster("sand_0-5cm_mean_30s.tif")
+ocd <- raster("ocd_0-5cm_mean_30s.tif")
+sphw <- raster("phh2o_0-5cm_mean_30s.tif")
+tns <- raster("nitrogen_0-5cm_mean_30s.tif")
+```
+
+Bring in soil P raster data from
+SOURCE: Yang, X., Post, W. M., Thornton, P. E., &amp; Jain, A. K. (2014). <i>Global Gridded Soil Phosphorus Distribution Maps at 0.5-degree Resolution</i> (Version 1). ORNL Distributed Active Archive Center. https://doi.org/10.3334/ORNLDAAC/1223 Date Accessed: 2025-12-16
+DATA REPOSITORY: https://urs.earthdata.nasa.gov/oauth/authorize?client_id=eszUe9OMxRl3-290KmSzxA&redirect_uri=https%3A%2F%2Fdata.ornldaac.earthdata.nasa.gov%2Flogin&response_type=code&state=%2Fprotected%2Fbundle%2FGlobal_Phosphorus_Dist_Map_1223.zip
+UNITS: g/m2
+RESOLUTION: ~56 km
+
+```{r}
+TSP <- raster("pforms_den.nc")
+```
+
+Bring in P deposition data
+SOURCE: R. Wang et al., Global forest carbon uptake due to nitrogen and phosphorus deposition from 1850 to 2100. Global change biology 23, 4854-4872 (2017).
+DATA REPOSITORY: https://figshare.com/s/898e5d6c4f0982674ae3?file=24714119
+UNITS: mg/m2/yr
+RESOLUTION: ~111 km
+
+```{r}
+data_list <- read.mat("N&Pdep_land.mat")
+
+# Restrict to get just P deposition
+Pdep<-data_list$Pdep_land
+
+# Restrict to 1997-2013 (drop 1980,1990)
+Pdep<-Pdep[16:19]
+Pdep<-do.call(rbind, Pdep)
+Pdep<-Pdep[5:8]
+
+# Get mean of geographic matrices 2010-2013
+mean_Pdep <- mat_mean(Pdep)
+
+# Turn matrix into a raster
+TPdepr <- rast(mean_Pdep)
+
+# Set nodata value to NA
+values(TPdepr)[is.nan(values(TPdepr))] <- NA
+
+# Define a new extent object using xmin, xmax, ymin, ymax
+# To convert from 0-360, 0-90 to pos-neg values
+new_ext <- ext(c(-180, 180, -90, 90))
+
+# Assign the new extent to the raster
+ext(TPdepr) <- new_ext
+
+# Define coordinate system
+crs(TPdepr) <- crs(TSP)
+
+# Convert to molar
+TPdepr2<-TPdepr/1000/30.974
+
+# Convert to raster from spatraster
+TPdepr <- raster(TPdepr)
+TPdepr2 <- raster(TPdepr2)
+
+# Restrict to get just P deposition
+Ndep<-data_list$Ndep_land
+
+# Restrict to 1997-2013 (drop 1980,1990)
+Ndep<-Ndep[16:19]
+Ndep<-do.call(rbind, Ndep)
+Ndep<-Ndep[5:8]
+
+# Get mean of geographic matrices 2010-2013
+mean_Ndep <- mat_mean(Ndep)
+
+# Turn matrix into a raster
+TNdepr <- rast(mean_Ndep)
+
+# Set nodata value to NA
+values(TNdepr)[is.nan(values(TNdepr))] <- NA
+
+# Define a new extent object using xmin, xmax, ymin, ymax
+# To convert from 0-360, 0-90 to pos-neg values
+new_ext <- ext(c(-180, 180, -90, 90))
+
+# Assign the new extent to the raster
+ext(TNdepr) <- new_ext
+
+# Convert to molar
+TNdepr2<-TNdepr/1000*14.0067
+
+# Convert to raster from spatraster
+TNdepr <- raster(TNdepr)
+TNdepr2 <- raster(TNdepr2)
+
+# Define coordinate system
+crs(TNdepr) <- crs(TSP)
+
+# Get the ratio of total N deposition to total P deposition
+TN2TP <- TNdepr2/TPdepr2
+```
+
+Stack rasters.
+
+```{r}
+stack1 <- raster::stack(tpi, slope, elev)
+stack2 <- raster::stack(clay, silt, sand, ocd, sphw, tns)
+stack3 <- raster::stack(NO3, DRP)
+stack4 <- raster::stack(TNdepr, TPdepr, TN2TP)
+```
+
+Load HydroBASINS data.
+The HydroBASINS shape file is large (>1 GB) and not uploaded in this repository
+SOURCE: Linke et al. (2019) https://doi.org/10.1038/s41597-019-0300-6
+DATA REPOSITORY: https://www.hydrosheds.org/products/hydroatlas
+RESOLUTION: 12-digit subwatersheds
+
+```{r}
+basins<-st_read("BasinATLAS_v10_lev12.shp")
+
+# Transform subwatershed polygons to equal distance Mollweide projection
+bas_moll <- st_transform(basins, "+proj=moll")
+```
+
+```{r}
+test<-as.data.frame(TSP,xy=T,na.rm=T)
+Tpts<-SpatialPointsDataFrame(test[,c('x','y')], test, proj4string=CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+t2<-raster::extract(stack2,Tpts,df=T)
+t3<-raster::extract(stack3,Tpts,df=T)
+t4<-raster::extract(stack4,Tpts,df=T)
+test<-cbind(test,t2,t3,t4)
+test<-test[,c(3,5,8,9,10,12,13,15,16,17)]
+colnames(test)<-c("TSP","clay","OCD","pH","TNS","NOx","DRP","Ndep","Pdep","TN2TP")
+test$DRP<-log10(test$DRP)
+test$NOx<-log10(test$NOx)
+library("PerformanceAnalytics")
+chart.Correlation(test, histogram=TRUE, pch=19)
+```
+
+Extract raster datasets to CELLDEX point locations.
+
+```{r}
+# Join raster data at CELLDEX STREAM locations
+tempdat <- raster::extract(stack1, Spts, df = T)
+colnames(tempdat) <- c("ID", "tpi", "slope", "elev")
+Spts@data<-cbind(Spts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(stack2, Spts, df = T)
+colnames(tempdat) <- c("ID", "clay", "silt", "sand", "ocd", "sphw", "tns")
+Spts@data<-cbind(Spts@data,tempdat[,2:7])
+
+tempdat <- raster::extract(stack3, Spts, df = T)
+colnames(tempdat) <- c("ID", "NO3c", "DRPc")
+Spts@data<-cbind(Spts@data,tempdat[,2:3])
+
+tempdat <- raster::extract(stack4, Spts, df = T)
+colnames(tempdat) <- c("ID", "TNdep", "TPdep", "TN2TP")
+Spts@data<-cbind(Spts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(TSP, Spts, df = T)
+colnames(tempdat) <- c("ID", "Total.Soil.P")
+Spts@data<-cbind(Spts@data,tempdat)
+Spts@data$ID <- NULL
+
+# Join raster data at CELLDEX RIPARIAN locations
+tempdat <- raster::extract(stack1, Rpts, df = T)
+colnames(tempdat) <- c("ID", "tpi", "slope", "elev")
+Rpts@data<-cbind(Rpts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(stack2, Rpts, df = T)
+colnames(tempdat) <- c("ID", "clay", "silt", "sand", "ocd", "sphw", "tns")
+Rpts@data<-cbind(Rpts@data,tempdat[,2:7])
+
+tempdat <- raster::extract(stack3, Rpts, df = T)
+colnames(tempdat) <- c("ID", "NO3c", "DRPc")
+Rpts@data<-cbind(Rpts@data,tempdat[,2:3])
+
+tempdat <- raster::extract(stack4, Rpts, df = T)
+colnames(tempdat) <- c("ID", "TNdep", "TPdep", "TN2TP")
+Rpts@data<-cbind(Rpts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(TSP, Rpts, df = T)
+colnames(tempdat) <- c("ID", "Total.Soil.P")
+Rpts@data<-cbind(Rpts@data,tempdat)
+Rpts@data$ID <- NULL
+```
+
+Convert CELLDEX stream and riparian points to sf objects, transform to Mollweide,spatially join points to the attributes of the nearest HydroBASINS subwatershed, and turn -999 values (no data as represented in HydroBASINS) to NA.
+
+```{r}
+S_st <- as(Spts,"sf")
+S_moll <- st_transform(S_st,"+proj=moll")
+S_stb <- st_join(S_moll, bas_moll, join = st_nearest_feature)
+S_stb$geometry <- NULL
+S_stb[S_stb==-999] <- NA
+R_st <- as(Rpts,"sf")
+R_moll <- st_transform(R_st,"+proj=moll")
+R_stb <- st_join(R_moll, bas_moll, join = st_nearest_feature)
+R_stb$geometry <- NULL
+R_stb[R_stb==-999] <- NA
+```
+
+Pull out climate data by HydroBASINS subwatershed for the month of cotton deployment for each CELLDEX site.
+
+```{r}
+S_stb$tempmonth<-NULL
+S_stb$precipmonth<-NULL
+S_stb$PETmonth<-NULL
+S_stb$AETmonth<-NULL
+S_stb$snowmonth<-NULL
+S_stb$soilwatermonth<-NULL
+for(i in 1:nrow(S_stb)) {
+  month<-S_stb$month[i]
+  if (!is.na(month)){
+    S_stb$tempmonth[i]<-S_stb[i,paste0("tmp_dc_s",month)]
+    S_stb$precipmonth[i]<-S_stb[i,paste0("pre_mm_s",month)]
+    S_stb$PETmonth[i]<-S_stb[i,paste0("pet_mm_s",month)]
+    S_stb$AETmonth[i]<-S_stb[i,paste0("aet_mm_s",month)]
+    S_stb$snowmonth[i]<-S_stb[i,paste0("snw_pc_s",month)]
+    S_stb$soilwatermonth[i]<-S_stb[i,paste0("swc_pc_s",month)]
+  }
+}
+R_stb$tempmonth<-NULL
+R_stb$precipmonth<-NULL
+R_stb$PETmonth<-NULL
+R_stb$AETmonth<-NULL
+R_stb$snowmonth<-NULL
+R_stb$soilwatermonth<-NULL
+for(i in 1:nrow(R_stb)) {
+  month<-R_stb$month[i]
+  if (!is.na(month)){
+    R_stb$tempmonth[i]<-R_stb[i,paste0("tmp_dc_s",month)]
+    R_stb$precipmonth[i]<-R_stb[i,paste0("pre_mm_s",month)]
+    R_stb$PETmonth[i]<-R_stb[i,paste0("pet_mm_s",month)]
+    R_stb$AETmonth[i]<-R_stb[i,paste0("aet_mm_s",month)]
+    R_stb$snowmonth[i]<-R_stb[i,paste0("snw_pc_s",month)]
+    R_stb$soilwatermonth[i]<-R_stb[i,paste0("swc_pc_s",month)]
+  }
+}
+```
+
+Build subset of the data to exclude (1) all monthly data, (2) all class variables (biome, ecoregion, freshwater ecoregion, potential natural vegetation),(3) variables with no variance, and (4) composite indices (i.e., human development, human footprint, human development index, night lights). Simultaneously, log transform variables that have large skew and back-transform 10x and 100x corrections done in HydroBASINS. Select variables needing transformation or back-transformation are identified in the variable names datasheet.
+
+```{r}
+mod_vars <- read.csv(file="var_names_rip.csv")
+
+# Setup empty dataframes
+Sdat <- data.frame(logk = S_stb$logk, mean_mean_daily_temp_str = S_stb$mean_mean_daily_temp_str)
+Rdat <- data.frame(logk = R_stb$logk, mean_mean_daily_temp_rip = R_stb$mean_mean_daily_temp_rip)
+
+# For loop to select variables and complete transformations 
+for(i in 1:length(mod_vars$Variables)){
+  if(mod_vars$Transform[i]=="none"){
+    tempname <- mod_vars$Variables[i]
+    Sdat <- cbind(Sdat,S_stb[,mod_vars$Variables[i]])
+    colnames(Sdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="log"){
+    tempname <- paste0("log10",mod_vars$Variables[i])
+    Sdat <- cbind(Sdat,log10(S_stb[,mod_vars$Variables[i]]))
+    colnames(Sdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="log1"){
+    tempname <- paste0("log10",mod_vars$Variables[i])
+    Sdat <- cbind(Sdat,log10(S_stb[,mod_vars$Variables[i]]+1))
+    colnames(Sdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="xten"){
+    tempname <- mod_vars$Variables[i]
+    Sdat <- cbind(Sdat,(S_stb[,mod_vars$Variables[i]]/10))
+    colnames(Sdat)[i+2] = tempname
+  } else
+    if(mod_vars$Transform[i]=="log1xten"){
+      tempname <- paste0("log10",mod_vars$Variables[i])
+      Sdat <- cbind(Sdat,log10(S_stb[,mod_vars$Variables[i]]/10+1))
+      colnames(Sdat)[i+2] = tempname
+    }
+}
+
+for(i in 1:length(mod_vars$Variables)){
+  if(mod_vars$Transform[i]=="none"){
+    tempname <- mod_vars$Variables[i]
+    Rdat <- cbind(Rdat,R_stb[,mod_vars$Variables[i]])
+    colnames(Rdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="log"){
+    tempname <- paste0("log10",mod_vars$Variables[i])
+    Rdat <- cbind(Rdat,log10(R_stb[,mod_vars$Variables[i]]))
+    colnames(Rdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="log1"){
+    tempname <- paste0("log10",mod_vars$Variables[i])
+    Rdat <- cbind(Rdat,log10(R_stb[,mod_vars$Variables[i]]+1))
+    colnames(Rdat)[i+2] = tempname
+  } else
+  if(mod_vars$Transform[i]=="xten"){
+    tempname <- mod_vars$Variables[i]
+    Rdat <- cbind(Rdat,(R_stb[,mod_vars$Variables[i]]/10))
+    colnames(Rdat)[i+2] = tempname
+  } else
+    if(mod_vars$Transform[i]=="log1xten"){
+      tempname <- paste0("log10",mod_vars$Variables[i])
+      Rdat <- cbind(Rdat,log10(R_stb[,mod_vars$Variables[i]]/10+1))
+      colnames(Rdat)[i+2] = tempname
+    }
+}
+```
+
+Filter data to remove near zero variance x-variables and to eliminate x-variables that are 0.85 or more correlated.
+
+```{r}
+# Identify near zero variance predictors
+nzv_indices <- nearZeroVar(Rdat)
+
+# Remove near zero variance predictors
+Rdat <- Rdat[, -nzv_indices]
+
+# Eliminate highly corelated x-variables
+Rdat<-treatment_corr(Rdat, corr_thres = 0.85, treat = TRUE, verbose = TRUE)
+
+# Identify near zero variance predictors
+nzv_indicesS <- nearZeroVar(Sdat)
+
+# Remove near zero variance predictors
+Sdat <- Sdat[, -nzv_indicesS]
+
+# Eliminate highly corelated x-variables
+Sdat<-treatment_corr(Sdat, corr_thres = 0.85, treat = TRUE, verbose = TRUE)
+```
+
+###BOOSTED REGRESSION TREE MODELS###
+Linear regression (e.g. Gaussian error) BRT models of riparian and stream ln Kd. 
+
+```{r}
+# Stream BRT model
+set.seed(15)
+#Sdat$sr<-NULL
+#Sdat$sr<-log10((10^Sdat$log10NO3c/28014)/((10^Sdat$log10DRPc)/30974)) 
+Sgbm<- gbm(logk~.,
+           data=Sdat,#[,c(1:3,7:9,11,17:18,27,29:30,38,43:48,50:51)], 
+           distribution="gaussian",
+           n.trees=5000,
+           shrinkage=0.01,
+           interaction.depth=5,
+           cv.folds=20,
+           n.cores=12)
+
+# Check performance
+(best.iterS <- gbm.perf(Sgbm,method="cv"))
+sqrt(Sgbm$cv.error[best.iterS]) #RMSE for cellulose model
+
+# Plot variable influence based on the estimated best number of trees
+Ssum<-summary(Sgbm,n.trees=best.iterS,method=permutation.test.gbm) 
+head(Ssum,20)
+
+# Calculate pseudo-R2
+print(1-sum((Sdat$logk - predict(Sgbm, newdata=Sdat, n.trees=best.iterS))^2)/
+            sum((Sdat$logk - mean(Sdat$logk))^2))
+
+# Riparian BRT model
+set.seed(15)
+Rdat$sr<-log10(10^Rdat$log10NO3c/10^Rdat$log10DRPc)
+Rgbm<- gbm(logk~.,
+           data=Rdat[,c(1,2,4,5,7,8,9,17,18,20,27,29,30,38,44,45,47,50,51)], 
+           distribution="gaussian",
+           n.trees=50000,
+           shrinkage=0.001,
+           interaction.depth=5,
+           cv.folds=20,
+           n.cores=12)
+
+# Check performance
+(best.iterR <- gbm.perf(Rgbm,method="cv"))
+sqrt(Rgbm$cv.error[best.iterR]) #RMSE for cellulose model
+
+# Plot variable influence based on the estimated best number of trees
+Rsum<-summary(Rgbm,n.trees=best.iterR,method=permutation.test.gbm) 
+head(Rsum,20)
+
+# Calculate pseudo-R2
+print(1-sum((Rdat$logk - predict(Rgbm, newdata=Rdat, n.trees=best.iterR))^2)/sum((Rdat$logk - mean(Rdat$logk))^2))
+
+# Difference BRT model 
+set.seed(15)
+Ddat <- cbind(CELLDEX_DR[,4:5],Sdat[,2:50])
+
+Dgbm<- gbm(diff~.,
+           data=Ddat, 
+           distribution="gaussian",
+           n.trees=50000,
+           shrinkage=0.001,
+           interaction.depth=5,
+           cv.folds=20,
+           n.cores=12)
+
+# Check performance
+(best.iterD <- gbm.perf(Dgbm,method="cv"))
+sqrt(Dgbm$cv.error[best.iterD]) #RMSE for cellulose model
+
+# Plot variable influence based on the estimated best number of trees
+Dsum<-summary(Dgbm, n.trees = best.iterD, method = permutation.test.gbm) 
+head(Dsum,20)
+
+# Calculate pseudo-R2
+print(1-sum((Ddat$diff - predict(Dgbm, newdata = Ddat, n.trees = best.iterD))^2)/sum((Ddat$diff - mean(Ddat$diff))^2))
+
+plot(Sgbm,i.var="clay")
+plot(Sgbm,i.var="mean_mean_daily_temp_str")
+plot(Sgbm,i.var="sphw")
+plot(Sgbm,i.var="ocd")
+plot(Sgbm,i.var="elev")
+plot(Sgbm,i.var="log10NO3c")
+plot(Rgbm,i.var=c("log10TPdep","clay"))
+plot(Rgbm,i.var=c("log10TPdep","sphw"))
+plot(Rgbm,i.var="clay")
+plot(Rgbm,i.var="mean_mean_daily_temp_rip")
+plot(Rgbm,i.var="tpi")
+plot(Rgbm,i.var="AETmonth")
+plot(Rgbm,i.var="log10TPdep")
+plot(Rgbm,i.var="slp_dg_uav")
+plot(Rgbm,i.var="log10DRPc")
+plot(Rgbm,i.var="log10Total.Soil.P")
+plot(Rgbm,i.var="log10TN2TP")
+plot(Sgbm,i.var="log10TN2TP")
+```
+
+Figure S1. Barplots of the relative importance of the 48 predictor variables as determined by permutation tests (Breiman 2001) for the riparian Kd, left, pseudo-r2 = 0.92, stream Kd, middle, pseudo-r2 = 0.85, and stream – riparian Kd, left, pseudo-r2 = 0.66, BRT models of cotton strip decomposition rate – predictors across models are colored similarly. Note that in x-axis titles 1) “measured” values were recorded during the experiments, 2) “site” values correspond to the raster cells overlain by the experimental sites, 3) “upstream” values summarize of the HydroBASINS data for the entire watershed area above the pour point of the subwatershed corresponding to the site, whereas 4) unlabeled values are summaries at the HydroBASINS 12-digit subwatershed. 
+
+```{r}
+Rimp <- as.data.frame(Rsum)
+Rimp$var[4] <- "mean_mean_daily_temp_rip"
+vard <- read.csv("var_descriptions.csv")
+Rimp <- merge(Rimp, vard, all.x = T)
+Rimp <- Rimp[order(-Rimp$rel.inf), ]
+barR <- ggplot(Rimp, aes(x = reorder(name, rel.inf), y = rel.inf)) + geom_bar(aes(fill = name), stat = "identity") + coord_flip() + ylab("") + xlab("") + ggtitle("Riparian") + theme(plot.title = element_text(color = "brown", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill='transparent'), plot.background = element_rect(fill='transparent', color=NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+Simp <- as.data.frame(Ssum)
+Simp <- merge(Simp, vard, all.x = T)
+Simp <- Simp[order(-Simp$rel.inf), ]
+barS <- ggplot(Simp, aes(x = reorder(name, rel.inf), y = rel.inf)) + geom_bar(aes(fill = name), stat = "identity") + coord_flip() + ylab("") + xlab("") + ggtitle("Stream") + theme(plot.title = element_text(color = "blue", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+Dimp <- as.data.frame(Dsum)
+Dimp <- merge(Dimp, vard, all.x = T)
+Dimp <- Dimp[order(-Dimp$rel.inf), ]
+barD <- ggplot(Dimp, aes(x = reorder(name, rel.inf), y = rel.inf)) + geom_bar(aes(fill = name), stat = "identity") + coord_flip() + ylab("") + xlab("") + ggtitle("Stream - Riparian") + theme(plot.title = element_text(color = "red", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color=NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+# Supplementary barplots
+pdf("FigS1_riparian_stream_importance_barplots.pdf", width = 30, height = 15)
+grid.arrange(barR, barS, barD, ncol = 3)
+dev.off()
+```
+
+Figure 3. Barplots of the top six variables in relative importance as determined by permutation tests (Breiman 2001) of the riparian Kd, left, stream Kd, middle, and stream – riparian Kd, left, BRT models – predictor variables across models are colored similarly. Note that data from variables labeled as 1) “measured” were collected during the experiments, 2) “site” correspond to the values of various raster data sources at experimental site, and 3) “upstream”, HydroBASINS summary values of the entire watershed area upstream of the pour point of the subwatershed containing the CELLDEX experiment site. The remaining variables are summaries by HydroBASINS 12-digit subwatershed.
+
+```{r}
+# Barplots of the top 6 variables in importance
+var <- rbind(Rsum[1:6,],Ssum[1:6,],Dsum[1:6,])
+var <- unique(var[,1])
+var <- as.data.frame(var)
+colors <- c("brown", "blue", "gray", "tan", "darkgreen","red","cornflowerblue","turquoise", "purple","pink","orange","green","gold")
+colors <- as.data.frame(colors)
+var <- as.data.frame(cbind(var,colors))
+Rimp <- merge(Rimp[1:6,], var[], by = "var", all.x = T)
+Simp <- merge(Simp[1:6,], var[], by = "var", all.x = T)
+Dimp <- merge(Dimp[1:6,], var[], by = "var", all.x = T)
+
+barR2 <- ggplot(Rimp, aes(x = reorder(var, rel.inf), y = rel.inf)) + geom_bar(fill = Rimp$colors, stat = "identity") + coord_flip() + ylab("") + xlab("") + ylim(0, 21) + ggtitle("Riparian") + scale_x_discrete(labels = c("clay" = "Site soil % clay 0-5 cm", "mean_mean_daily_temp_rip" = expression("         Mean measured daily AIR temp during deployment ("*degree*"C)"), "log10TN2TP" = "Site total annual N:P deposition ratio", "AETmonth" = "Mean AET month of deployment (mm)","tpi" = "Site topographic position index", "slp_dg_uav" = expression("Mean slope upstream ("*degree*")"),"log10DRPc" = expression("Site stream DRP yield (kg ha"^"-1"~"yr"^"-1"*")"), "tempmonth" = expression("Mean air temp during month of deployment ("*degree*"C)"))) + theme(plot.title = element_text(color = "brown", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill='transparent'), plot.background = element_rect(fill='transparent', color=NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+barS2 <- ggplot(Simp, aes(x = reorder(var, rel.inf), y = rel.inf)) + geom_bar(fill = Simp$colors, stat = "identity") + coord_flip() + ylab("") + xlab("") + ylim(0, 21) + ggtitle("Stream") + scale_x_discrete(labels = c("clay" = "Site soil % clay 0-5 cm", "mean_mean_daily_temp_str" = expression("Mean measured daily STREAM temp during deployment ("*degree*"C)"), "log10TN2TP" = "Site total annual N:P deposition ratio", "elev" = "Site elevation (m)", "sphw" = "Site soil pH (water) 0-5", "ocd" = expression("Site soil organic C density 0-5 cm (kg m"^"-3"*")"), "log10NO3c" = expression("Site stream NO"[3]*"+NO"[2]~"yield (kg ha"^"-1"~"yr"^"-1"*")"), "slope" = expression("Site mean slope ("*degree*")"), "tns" = expression("Site soil total N 0-5 cm (g kg"^"-1"*")"))) + theme(plot.title = element_text(color = "blue", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color=NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+barD2 <- ggplot(Dimp, aes(x = reorder(var, rel.inf), y = rel.inf)) + geom_bar(fill = Dimp$colors, stat = "identity") + coord_flip() + ylab("") + xlab("") + ylim(0, 21) + ggtitle("Stream - Riparian") + scale_x_discrete(labels = c("mean_mean_daily_temp_rip" = expression("         Mean measured daily AIR temp during deployment ("*degree*"C)"), "log10NO3c" = expression("Site stream NO"[3]*"+NO"[2]~"yield (kg ha"^"-1"~"yr"^"-1"*")"), "log10TPdep" = expression("Site total P deposition (kg ha"^"-1"~"yr"^"-1"*")"), "mean_mean_daily_temp_str" = expression("Mean measured daily STREAM temp during deployment ("*degree*"C)"), "aet_mm_uyr" = "Mean annual AET (mm)", "AETmonth" = "Mean AET month of deployment (mm)", "sand" = "Site mean soil % sand 0-5 cm", "sphw" = "Site mean soil pH (water) 0-5 cm")) + theme(plot.title = element_text(color = "red", face = "bold"), text = element_text(size = 20), legend.position = "none", panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color=NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_rect(colour = "black", fill = NA, size = 0.5))
+
+# Publication barplots
+pdf("Fig3_riparian_stream_importance_barplots_top.pdf", width = 12, height = 14)
+grid.arrange(barR2, barS2, barD2, ncol = 1)
+dev.off()
+```
+
+######RIPARIAN VALIDATION MODEL#######
+Load and clean validation data.
+SOURCE: Wu et al. (2020) https://www.pnas.org/doi/epub/10.1073/pnas.2420664122
+DATA REPOSITORY: https://www.pnas.org/doi/10.1073/pnas.2420664122#supplementary-materials
+
+###METHODS###
+We restricted data from Wu et al. (2020) to exclude data from assays that 1) used woody material, and bamboo, conifer or mangrove tissue, which had anomalous values 2) did not use litter bags, or 3) was missing data for key categorical variables supplied by Wu et al. (decomposition stage, ecosystem, vegetation). Ecosystem categories included mangrove and vegetation categories bamboo and conifer.
+
+```{r}
+litter <- read.csv("pnas.2420664122.sd03.csv")
+
+# Restrict to leaf litter decay studies and of those that use litter bags and drop "mangrove"
+litter <- subset(litter, Litter.type == "Leaf")
+litter <- subset(litter, Method == "Litter bag")
+litter <- litter[-which(litter$Ecosystem == "Mangrove"),]
+
+# Turn litter data into spatial points data frame
+litter_pts <- SpatialPointsDataFrame(litter[,c("lon", "lat")], litter, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# Get raster data at litter data locations
+tempdat <- raster::extract(stack1, litter_pts, df = T)
+colnames(tempdat) <- c("ID", "tpi", "slope", "elev")
+litter_pts@data<-cbind(litter_pts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(stack2, litter_pts, df = T)
+colnames(tempdat) <- c("ID", "clay", "silt", "sand", "ocd", "sphw", "tns")
+litter_pts@data<-cbind(litter_pts@data,tempdat[,2:7])
+
+tempdat <- raster::extract(stack3, litter_pts, df = T)
+colnames(tempdat) <- c("ID", "NO3c", "DRPc")
+litter_pts@data<-cbind(litter_pts@data,tempdat[,2:3])
+
+tempdat <- raster::extract(stack4, litter_pts, df = T)
+colnames(tempdat) <- c("ID", "TNdep", "TPdep", "TN2TP")
+litter_pts@data<-cbind(litter_pts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(TSP, litter_pts, df = T)
+colnames(tempdat) <- c("ID", "Total.Soil.P")
+litter_pts@data<-cbind(litter_pts@data,tempdat)
+litter_pts@data$ID <- NULL
+
+# Convert litter points to sf object
+litter_st<-as(litter_pts,"sf")
+
+# Transform litter spatial points to Mollweide
+litter_moll<-st_transform(litter_st,"+proj=moll")
+
+# Spatially join litter stream points to attributes of nearest subwatershed
+litter_stb<-st_join(litter_moll, bas_moll, join = st_nearest_feature)
+litter_stb$geometry<-NULL
+
+# Turn -999 values (no data as represented in Hydrobasins) to NA
+litter_stb[litter_stb==-999]<-NA
+
+# Litter database does not include time of deployment
+# All month of deployment variables are NA
+litter_stb$tempmonth<-NA
+litter_stb$precipmonth<-NA
+litter_stb$PETmonth<-NA
+litter_stb$AETmonth<-NA
+litter_stb$moist_indexmonth<-NA
+litter_stb$snowmonth<-NA
+litter_stb$soilwatermonth<-NA
+
+# Build subset including predictor variables used for CELLDEX model
+# Simultaneously, log transform variables that have large skew and back-transform 10x and 100x corrections done in HydroBASINS
+# Setup empty dataframe
+Ldat <- data.frame(logk = litter_stb$logk)
+
+# For loop to select variables and complete transformations 
+for(i in 2:length(mod_vars$Variables)){
+  if(mod_vars$Transform[i]=="none"){
+    tempname <- mod_vars$Variables[i]
+    Ldat <- cbind(Ldat,litter_stb[,mod_vars$Variables[i]])
+    colnames(Ldat)[i] = tempname
+  } else
+    if(mod_vars$Transform[i]=="log"){
+      tempname <- paste0("log10",mod_vars$Variables[i])
+      Ldat <- cbind(Ldat,log10(litter_stb[,mod_vars$Variables[i]]))
+      colnames(Ldat)[i] = tempname
+    } else
+      if(mod_vars$Transform[i]=="log1"){
+        tempname <- paste0("log10",mod_vars$Variables[i])
+        Ldat <- cbind(Ldat,log10(litter_stb[,mod_vars$Variables[i]]+1))
+        colnames(Ldat)[i] = tempname
+      } else
+        if(mod_vars$Transform[i]=="xten"){
+          tempname <- mod_vars$Variables[i]
+          Ldat <- cbind(Ldat,(litter_stb[,mod_vars$Variables[i]]/10))
+          colnames(Ldat)[i] = tempname
+        } else
+          if(mod_vars$Transform[i]=="xhund"){
+            tempname <- mod_vars$Variables[i]
+            Ldat <- cbind(Ldat,(litter_stb[,mod_vars$Variables[i]]/100))
+            colnames(Ldat)[i] = tempname
+          } else
+            if(mod_vars$Transform[i]=="log1xten"){
+              tempname <- paste0("log10",mod_vars$Variables[i])
+              Ldat <- cbind(Ldat,log10(litter_stb[,mod_vars$Variables[i]]/10+1))
+              colnames(Ldat)[i] = tempname
+            }
+}
+Ldat$mean_mean_daily_temp_rip <- rep(NA, nrow(Ldat))
+
+# Predict ln(k) for litter sites using riparian ln(k) model (Rgbm) above
+litter$ln_pred_k<-predict(Rgbm, newdata=Ldat, n.trees=best.iterR)
+
+# Log10-transform Initial CtoN ratio
+litter$Initial.C.N <- log10(litter$Initial.C.N)
+
+# Make spatial points dataframe of litter validation locations
+litter_spdfR <- SpatialPointsDataFrame(litter[,c("lon", "lat")], litter, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# Run the boosted regression tree validation model
+set.seed(15)
+litter$stage[which(litter$stage == "")] <- NA
+litter$stage<-as.factor(litter$stage)
+
+Lgbm<- gbm(logk~., 
+           data = litter[,c(6:7,46:49)], 
+           distribution = "gaussian",
+           n.trees = 10000,
+           shrinkage = 0.1,
+           interaction.depth = 5,
+           cv.folds=20,
+           n.cores=12)
+
+# Check performance
+(best.iterL <- gbm.perf(Lgbm, method = "cv"))
+sqrt(Lgbm$cv.error[best.iterL]) # RMSE for litter model
+
+# Plot variable influence based on the estimated best number of trees
+Lsum<-summary(Lgbm,n.trees=best.iterL,method=permutation.test.gbm) 
+
+# Calculate pseudo-R2
+print(1-sum((litter$logk - predict(Lgbm, newdata = litter, n.trees = best.iterL))^2)/sum((litter$logk - mean(litter$logk))^2))
+```
+
+######STREAM VALIDATION MODEL#######
+SOURCE: LeRoy et al. (2020) https://doi.org/10.1111/1365-2745.13262
+DATA REPOSITORY: https://github.com/andrew-hipp/decomposition-phylogeny-2019
+DATA PROCESSING: See 'litter process.R'
+
+```{r}
+litterS <- read.csv("litter_processed.csv")
+litterS$logk <- log(litterS$mean_kd)
+litterS$mean_kd <- NULL
+litterS$Citation <- NULL
+litterS$Sorting.code <- NULL
+colnames(litterS)[6] <- "mean_mean_daily_temp_str"
+
+# Turn litter data into spatial points data frame
+litter_ptsS <- SpatialPointsDataFrame(litterS[, c("longitude","latitude")], litterS, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# Get raster data at litter data locations
+tempdat <- raster::extract(stack1, litter_ptsS, df = T)
+colnames(tempdat) <- c("ID", "tpi", "slope", "elev")
+litter_ptsS@data<-cbind(litter_ptsS@data,tempdat[,2:4])
+
+tempdat <- raster::extract(stack2, litter_ptsS, df = T)
+colnames(tempdat) <- c("ID", "clay", "silt", "sand", "ocd", "sphw", "tns")
+litter_ptsS@data<-cbind(litter_ptsS@data,tempdat[,2:7])
+
+tempdat <- raster::extract(stack3, litter_ptsS, df = T)
+colnames(tempdat) <- c("ID", "NO3c", "DRPc")
+litter_ptsS@data<-cbind(litter_ptsS@data,tempdat[,2:3])
+
+tempdat <- raster::extract(stack4, litter_ptsS, df = T)
+colnames(tempdat) <- c("ID", "TNdep", "TPdep", "TN2TP")
+litter_ptsS@data<-cbind(litter_ptsS@data,tempdat[,2:4])
+
+tempdat <- raster::extract(TSP, litter_ptsS, df = T)
+colnames(tempdat) <- c("ID", "Total.Soil.P")
+litter_ptsS@data<-cbind(litter_ptsS@data,tempdat)
+litter_ptsS@data$ID <- NULL
+
+# Convert litter points to sf object
+litter_stS <- as(litter_ptsS,"sf")
+
+# Transform litter spatial points to Mollweide
+litter_mollS <- st_transform(litter_stS,"+proj=moll")
+
+# Spatially join litter stream points to attributes of nearest subwatershed
+litter_stbS <- st_join(litter_mollS, bas_moll, join = st_nearest_feature)
+litter_stbS$geometry <- NULL
+
+# Turn -999 values (no data as represented in Hydrobasins) to NA
+litter_stbS[litter_stbS == -999]<-NA
+
+# Litter database does not include time of deployment
+# All month of deployment variables are NA
+litter_stbS$tempmonth <- NA
+litter_stbS$precipmonth <- NA
+litter_stbS$PETmonth <- NA
+litter_stbS$AETmonth <- NA
+litter_stbS$moist_indexmonth <- NA
+litter_stbS$snowmonth <-NA
+litter_stbS$soilwatermonth <- NA
+
+# Build subset including predictor variables used for CELLDEX model
+# Simultaneously, log transform variables that have large skew and back-transform 10x and 100x corrections done in HydroBASINS
+# Setup empty dataframe
+LdatS <- data.frame(logk=litter_stbS$logk)
+
+# For loop to select variables and complete transformations 
+for(i in 1:length(mod_vars$Variables)){
+  if(mod_vars$Transform[i]=="none"){
+    tempname <- mod_vars$Variables[i]
+    LdatS <- cbind(LdatS,litter_stbS[,mod_vars$Variables[i]])
+    colnames(LdatS)[i] = tempname
+  } else
+    if(mod_vars$Transform[i]=="log"){
+      tempname <- paste0("log10",mod_vars$Variables[i])
+      LdatS <- cbind(LdatS,log10(litter_stbS[,mod_vars$Variables[i]]))
+      colnames(LdatS)[i] = tempname
+    } else
+      if(mod_vars$Transform[i]=="log1"){
+        tempname <- paste0("log10",mod_vars$Variables[i])
+        LdatS <- cbind(LdatS,log10(litter_stbS[,mod_vars$Variables[i]]+1))
+        colnames(LdatS)[i] = tempname
+      } else
+        if(mod_vars$Transform[i]=="xten"){
+          tempname <- mod_vars$Variables[i]
+          LdatS <- cbind(LdatS,(litter_stbS[,mod_vars$Variables[i]]/10))
+          colnames(LdatS)[i] = tempname
+        } else
+          if(mod_vars$Transform[i]=="xhund"){
+            tempname <- mod_vars$Variables[i]
+            LdatS <- cbind(LdatS,(litter_stbS[,mod_vars$Variables[i]]/100))
+            colnames(LdatS)[i] = tempname
+          } else
+            if(mod_vars$Transform[i]=="log1xten"){
+              tempname <- paste0("log10",mod_vars$Variables[i])
+              LdatS <- cbind(LdatS,log10(litter_stbS[,mod_vars$Variables[i]]/10+1))
+              colnames(LdatS)[i] = tempname
+            }
+}
+
+LdatS$mean_mean_daily_temp_str <- litterS$mean_mean_daily_temp_str
+
+# Predict ln(k) for litter sites using stream ln(k) model (Cgbm) above
+litterS$ln_pred_k <- predict(Sgbm, newdata = LdatS, n.trees = best.iterS)
+
+# Combine ln(k) predictions with litter condition and and substrate quality
+# in the form of genus-level leaf traits (mean) from TRY (Kattge et al., 2011)
+# also genus-level litter traits (mean) from literature review.
+# See 'litter process.R' for details.
+traits <- read.csv("traits.csv")
+litterS <- merge(litterS, traits, by = 'Genus')
+length(unique(litterS$Genus)) #35 genera with leaf OR litter traits
+
+# Eliminate highly corelated x-variables
+litterS<-treatment_corr(litterS, corr_thres = 0.7, treat = TRUE, verbose = TRUE)
+
+# Turn mesh size and leaf condition into factors
+litterS$Mesh.size <- as.factor(litterS$Mesh.size)
+litterS$Leaf.condition <- as.factor(litterS$Leaf.condition)
+
+set.seed(15)
+# Run the BRT validation model
+LgbmS<- gbm(logk~., 
+           data=litterS[,c(2:3,6:16)], 
+           distribution="gaussian",
+           n.trees=20000,
+           shrinkage=0.01,
+           interaction.depth = 5,
+           cv.folds=20,
+           n.cores=12)
+
+# Check performance
+(best.iterLS <- gbm.perf(LgbmS, method="cv"))
+sqrt(LgbmS$cv.error[best.iterLS]) #RMSE for litter model
+
+# Plot variable influence based on the estimated best number of trees
+LsumS<-summary(LgbmS, n.trees = best.iterLS, method = permutation.test.gbm) 
+LsumS
+
+# Calculate pseudo-R2
+print(1-sum((litterS$logk - predict(LgbmS, newdata = litterS, n.trees = best.iterLS))^2)/sum((litterS$logk - mean(litterS$logk))^2))
+```
+
+###GENERATE GLOBAL PREDICTIONS###
+Predict cotton ln Kd from stream and riparian BRT for all HydroBASINS subwatersheds, and use these values to calculate the ratio of stream to riparian Kd.
+
+```{r}
+# Use WorldClim data to set raster extent and resolution
+clim <- worldclim_global("tmin",res=10,path=tempdir())
+r <- raster::raster(clim$wc2.1_10m_tmin_12)
+
+# Extract values from Hydrobasins
+# Rasterize basins with DRP (3km) raster as template using fasterize package
+gr <- fasterize(basins, r, field = "HYBAS_ID", fun = "max")
+
+# Convert raster object to dataframe 
+grv <- as.data.frame(gr, xy = T)
+colnames(grv) <- c("longitude", "latitude", "HYBAS_ID")
+
+Gpts <-SpatialPointsDataFrame(grv[,c('longitude','latitude')], grv, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# Add data columns from the rasters
+tempdat <- raster::extract(stack1, Gpts, df = T)
+colnames(tempdat) <- c("ID", "tpi", "slope", "elev")
+Gpts@data<-cbind(Gpts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(stack2, Gpts, df = T)
+colnames(tempdat) <- c("ID", "clay", "silt", "sand", "ocd", "sphw", "tns")
+Gpts@data<-cbind(Gpts@data,tempdat[,2:7])
+
+tempdat <- raster::extract(stack3, Gpts, df = T)
+colnames(tempdat) <- c("ID", "NO3c", "DRPc")
+Gpts@data<-cbind(Gpts@data,tempdat[,2:3])
+
+tempdat <- raster::extract(stack4, Gpts, df = T)
+colnames(tempdat) <- c("ID", "TNdep", "TPdep", "TN2TP")
+Gpts@data<-cbind(Gpts@data,tempdat[,2:4])
+
+tempdat <- raster::extract(TSP, Gpts, df = T)
+colnames(tempdat) <- c("ID", "Total.Soil.P")
+Gpts@data<-cbind(Gpts@data,tempdat)
+Gpts@data$ID <- NULL
+
+grv2 <- Gpts@data
+grv2$Sort_code <- seq(1,dim(grv2)[1])
+
+# Set month of deployment variables for global prediction to NA
+# Variables were not among most important in BRT and are only available for CELLDEx sites
+# Global predictions are independent of month of deployment
+mod_vars_nomo <- mod_vars[!mod_vars$Variables %in% c("tempmonth","precipmonth","PETmonth","AETmonth","moist_indexmonth","snowmonth","soilwatermonth")&mod_vars$Source=="HydroBASINS",]
+
+# Build dataframe from HydroBASINS
+basin_dat <- as.data.frame(basins) ########
+basin_dat$sgr_dk_sav[basin_dat$sgr_dk_sav == -999] <- NA
+
+# Build HydroBASINS data and complete transformations 
+for(i in 1:length(mod_vars_nomo$Variables)){
+  if(mod_vars_nomo$Transform[i]=="none"){
+    tempname <- mod_vars_nomo$Variables[i]
+    tempdat <- cbind(basin_dat$HYBAS_ID,basin_dat[,mod_vars_nomo$Variables[i]])
+    grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+    colnames(grv2)[19+i] = tempname
+  } else
+    if(mod_vars_nomo$Transform[i]=="log"){
+      tempname <- paste0("log10",mod_vars_nomo$Variables[i])
+      tempdat <- cbind(basin_dat$HYBAS_ID,log10(basin_dat[,mod_vars_nomo$Variables[i]]))
+      grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+      colnames(grv2)[19+i] = tempname
+    } else
+      if(mod_vars_nomo$Transform[i]=="log1"){
+        tempname <- paste0("log10",mod_vars_nomo$Variables[i])
+        tempdat <- cbind(basin_dat$HYBAS_ID,log10(basin_dat[,mod_vars_nomo$Variables[i]]+1))
+        grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+        colnames(grv2)[19+i] = tempname
+      } else
+        if(mod_vars_nomo$Transform[i]=="xten"){
+          tempname <- mod_vars_nomo$Variables[i]
+          tempdat <- cbind(basin_dat$HYBAS_ID,basin_dat[,mod_vars_nomo$Variables[i]]/10)
+          grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+          colnames(grv2)[19+i] = tempname
+        } else
+          if(mod_vars_nomo$Transform[i]=="xhund"){
+          tempname <- mod_vars_nomo$Variables[i]
+        tempdat <- cbind(basin_dat$HYBAS_ID,basin_dat[,mod_vars_nomo$Variables[i]]/100)
+        grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+        colnames(grv2)[19+i] = tempname
+          } else
+            if(mod_vars_nomo$Transform[i]=="log1xten"){
+              tempname <- paste0("log10",mod_vars_nomo$Variables[i])
+              tempdat <- cbind(basin_dat$HYBAS_ID,log10(basin_dat[,mod_vars_nomo$Variables[i]]/10+1))
+              grv2 <- merge(grv2,tempdat,all.x=T,by.x="HYBAS_ID",by.y=1)
+              colnames(grv2)[19+i] = tempname
+            } 
+}
+
+# Resort to original position
+grv2 <- grv2[order(grv2$Sort_code),]
+
+# Monthly averages and mean_mean_daily_temp as NA
+grv2$tempmonth <- NA
+grv2$log10precipmonth <- NA
+grv2$PETmonth <- NA
+grv2$AETmonth <- NA
+grv2$moist_indexmonth <- NA
+grv2$snowmonth <- NA
+grv2$soilwatermonth <- NA
+grv2$mean_mean_daily_temp_str <- NA
+grv2$mean_mean_daily_temp_rip <- NA
+
+# Log transform nutrients
+grv2$log10NO3c <- log10(grv2$NO3c)
+grv2$log10DRPc <- log10(grv2$DRPc)
+grv2$log10TNdep <- log10(grv2$TNdep)
+grv2$log10TPdep <- log10(grv2$TPdep)
+grv2$log10Total.Soil.P <- log10(grv2$Total.Soil.P)
+grv2$log10TN2TP <- log10(grv2$TN2TP)
+
+# Make predictions of kd
+grv2$gl_kds <- predict(Sgbm, newdata = grv2, n.trees = best.iterS)
+grv2$gl_kdr <- predict(Rgbm, newdata = grv2, n.trees = best.iterR)
+
+# Turn predictions to NA where no Hydrobasins ID
+grv2$gl_kds[is.na(grv2$HYBAS_ID)] <- NA
+grv2$gl_kdr[is.na(grv2$HYBAS_ID)] <- NA
+
+# Produce the global raster image of cotton ln(kd)
+values <- grv2$gl_kds
+global_kds <- setValues(gr, values)
+values <- grv2$gl_kdr
+global_kdr <- setValues(gr, values)
+```
+
+###GLOBAL ln Kd MAP###
+Global map of cotton kd with stream and riparian side by side
+
+##CAPTION##
+Figure 1. Global maps of riparian, top, and stream, bottom, cotton decomposition (Kd) – inset maps show locations of CELLDEX (“Cotton strip”) sample sites, and of validation data (“Litter”) locations from Wu et al. (2020) for riparian and LeRoy et al. (2020) for streams. Subwatersheds with average annual stream discharge < 1.1 m3 s-1 (deserts, ice sheets) are in gray, oceans and large water bodies form white background. Note that these maps are predictions of ln-transformed Kd across the global land surface – built on data from parallel experiments performed at different sites in different seasons but during maximum leaf-fall by location in paired streams and riparian zones. 
+
+```{r}
+# Subset watersheds to map only those with average annual discharge > the minimum stream size sampled by CELLDEX
+CELLDEXmin <- min(R_stb$dis_m3_pyr)
+basins_min<-subset(basins, dis_m3_pyr < CELLDEXmin)
+gr2 <- fasterize(basins_min, r, field = "ENDO")
+gr2 <-gr2*0
+
+# Bring in shapefile boundary of Antarctica and convert to raster
+# DATA REPOSITORY: https://data.humdata.org/dataset/geoboundaries-admin-boundaries-for-antarctica
+a <- st_read("geoBoundaries-ATA-ADM0.shp")
+gr3 <- fasterize(a, r)
+gr3 <- gr3*0
+
+# Load lakes from HydroLakes https://www.hydrosheds.org/products/hydrolakes
+lakes <- st_read("HydroLAKES_polys_v10.shp")
+l <- fasterize(lakes, r, field = "Lake_type")
+l <- l*0
+
+# Do inverse mask of ln mean stream Kd during month of deployment to add subwatersheds that we did not predict stream Kd for including Antarctica and set value to the minimum value of predicted ln RIPARIAN Kd from our model
+min_predkd <- min(grv2$gl_kdr, na.rm = T)
+global_kds<-raster::mask(global_kds, inverse = T, gr2, updatevalue = min_predkd, updateNA = T)
+global_kds<-raster::mask(global_kds, inverse = T, gr3, updatevalue = min_predkd, updateNA = T)
+global_kds<-raster::mask(global_kds, inverse = T, l, updatevalue = NA, updateNA = T)
+
+# Do same for ln mean riparian kd during month of deployment
+global_kdr<-raster::mask(global_kdr, inverse = T, gr2, updatevalue = min_predkd, updateNA = T)
+global_kdr<-raster::mask(global_kdr, inverse = T, gr3, updatevalue = min_predkd, updateNA = T)
+global_kdr<-raster::mask(global_kdr, inverse = T, l, updatevalue = NA, updateNA = T)
+
+# Predicted global stream kd raster projected in Mollweide
+glkd_molls<-projectRaster(global_kds, crs = "+proj=moll")
+
+# Make dataframe of ln mean stream Kd raster and create column of 0s to represent watersheds with predictions
+mask_glkds <- as.data.frame(glkd_molls, xy = TRUE)
+colnames(mask_glkds)[3] <- "ln.mean.Kd"
+
+# Make a column of mask_glkds called land for plotting
+mask_glkds$land <- rep(NA, nrow(mask_glkds))
+mask_glkds$land[!is.na(mask_glkds$ln.mean.Kd)] <- 1
+mask_glkds$stream <- rep("Stream", nrow(mask_glkds))
+
+# Predicted global stream kd raster projected in Mollweide
+glkd_mollr <- projectRaster(global_kdr, crs = "+proj=moll")
+
+# Make dataframe of ln mean riparian Kd raster and create column of 0s to represent watersheds with predictions
+mask_glkdr <-as.data.frame(glkd_mollr, xy = TRUE)
+colnames(mask_glkdr)[3]<-"ln.mean.Kd"
+
+# Make a column of riparian mask_glkd called land for plotting
+mask_glkdr$land<-rep(NA, nrow(mask_glkdr))
+mask_glkdr$land[!is.na(mask_glkdr$ln.mean.Kd)] <- 1
+mask_glkdr$stream<-rep("Riparian",nrow(mask_glkdr))
+
+# Combine stream and riparian data into one dataframe and subset to just land pixels
+mask_glkd <- rbind(mask_glkdr, mask_glkds)
+mask_glkd <- mask_glkd[which(mask_glkd$land == 1), ]
+
+# Turn desert, ice, etc. to NA
+mask_glkd[which(mask_glkd$ln.mean.Kd < (min_predkd + 0.0000001)), 3] <- NA
+
+# Transform stream CELLDEX points to Mollweide
+Spts_moll<-spTransform(Spts, "+proj=moll")
+xy_stream<-data.frame(coordinates(Spts_moll), temp=Spts_moll$mean_mean_daily_temp_str)
+colnames(xy_stream)<-c("x","y","temp")
+
+# Transform riparian CELLDEX points to Mollweide
+Rpts_moll<-spTransform(Rpts,"+proj=moll")
+xy_rip<-data.frame(coordinates(Rpts_moll),temp=Rpts_moll$mean_mean_daily_temp_rip)
+colnames(xy_rip)<-c("x","y","temp")
+
+# Transform stream litter decomposition locations to Mollweide
+# SOURCE: LeRoy et al. (2020) https://doi.org/10.1111/1365-2745.13262
+# DATA REPOSITORY: https://github.com/andrew-hipp/decomposition-phylogeny-2019
+# DATA PROCESSING: See 'litter process.R'
+litterS <- read.csv("litter_processed.csv")
+litterS$logk <- log(litterS$mean_kd)
+length(unique(litterS$logk)) #559 unique locations with predicted kd
+
+# Turn stream litter data into spatial points data frame
+litter_spdfS<-SpatialPointsDataFrame(litterS[,c("longitude","latitude")],litterS,proj4string=CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# Transform stream litter decomposition locations to Mollweide
+litter_spdfS<-spTransform(litter_spdfS,"+proj=moll")
+xy_litter_stream<-data.frame(coordinates(litter_spdfS),temp=litter_spdfS$mean_mean_daily_temp)
+colnames(xy_litter_stream)<-c("x", "y", "res")
+
+# Transform riparian litter decomposition locations to Mollweide
+litter_spdfR<-spTransform(litter_spdfR,"+proj=moll")
+xy_litter_rip<-data.frame(coordinates(litter_spdfR),temp=litter_spdfR$climate.zone)
+colnames(xy_litter_rip)<-c("x","y","res")
+
+# Make map figures in ggplot 
+map <- ggplot(data = mask_glkd) + geom_tile(aes(x = x, y = y, fill = ln.mean.Kd)) + facet_wrap(~stream, ncol = 1) + scale_fill_gradientn(colors = turbo(10), na.value = "gray90", name = bquote('Cellulose K'[d]~" (d"^-1*")"), labels = c(0.05, 0.02, 0.007, 0.0025), breaks = c(-3, -4, -5, -6), limits = c(log(0.0018), log(0.085))) + xlab("") + ylab("") + theme(legend.position = c(0.075, 0.925), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size=9), legend.text = element_text(size=9)) + theme(panel.background = element_rect(fill = "white", colour = "white", size = 1, linetype = "solid")) + theme(axis.text.x = element_blank()) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(axis.ticks.x = element_blank()) + theme(axis.ticks.y = element_blank()) + theme(axis.text.y = element_blank()) 
+
+inset_rc <- ggplot() + geom_tile(data = dplyr::filter(mask_glkd, !is.na(land)), aes(x = x, y = y), fill = "cornsilk2",col="cornsilk") + geom_point(data = xy_rip, aes(x = x, y = y), fill = NA, col = "gray", shape = 21, size = 0.3, alpha = 0.5) + ggtitle("Cotton strip") + xlab("") + ylab("") + theme(legend.position = "none", legend.box.background = element_blank(), legend.background = element_blank()) + theme(panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.background = element_rect(fill='transparent'), legend.box.background = element_rect(fill = 'transparent'), axis.ticks.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.text.x = element_blank(), panel.border = element_rect(colour = "gray", fill = NA, size = 0.5), plot.title = element_text(size = 8))
+
+inset_rl <- ggplot() + geom_tile(data = dplyr::filter(mask_glkd, !is.na(land)), aes(x = x, y = y), fill = "cornsilk2",col="cornsilk") + ggtitle("Litter")+ geom_point(data = xy_litter_rip, aes(x = x, y = y), col = "gray", fill = NA, size = 0.2, shape = 21, alpha = 0.5) + xlab("") + ylab("") + theme(legend.position = "none", legend.box.background = element_blank(), legend.background = element_blank()) + theme(panel.background = element_rect(fill = 'transparent'), plot.background = element_rect(fill = 'transparent', color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.background = element_rect(fill='transparent'), legend.box.background = element_rect(fill = 'transparent'), axis.ticks.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.text.x = element_blank(), panel.border = element_rect(colour = "grey80", fill = NA, size = 0.5), plot.title = element_text(size = 8))
+
+inset_sc <- ggplot() + geom_tile(data = dplyr::filter(mask_glkd, !is.na(land)),aes(x = x, y = y), fill = "cornsilk2",col="cornsilk") + geom_point(data = xy_stream,aes(x = x, y = y), col = "gray", fill = NA, size = 0.2, shape = 21, alpha = 0.5) + ggtitle("Cotton strip") + xlab("") + ylab("") +  theme(legend.position = "none", legend.box.background = element_blank(), legend.background = element_blank()) + theme(panel.background = element_rect(fill='transparent'), plot.background = element_rect(fill = 'transparent', color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.background = element_rect(fill = 'transparent'), legend.box.background = element_rect(fill='transparent'), axis.ticks.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.text.x = element_blank(), panel.border = element_rect(colour = "grey80", fill = NA, size = 0.5), plot.title = element_text(size = 8))
+
+inset_sl <- ggplot() + geom_tile(data = dplyr::filter(mask_glkd, !is.na(land)),aes(x = x, y = y), fill = "cornsilk2",col="cornsilk") + geom_point(data = xy_litter_stream, aes(x = x, y = y), fill = NA, col = "gray", shape = 21, size = 0.3, alpha = 0.5) + ggtitle("Litter") + xlab("") + ylab("") +  theme(legend.position = "none", legend.box.background = element_blank(), legend.background = element_blank()) + theme(panel.background = element_rect(fill='transparent'), plot.background = element_rect(fill = 'transparent', color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.background = element_rect(fill = 'transparent'), legend.box.background = element_rect(fill='transparent'), axis.ticks.x = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank(), axis.text.x = element_blank(), panel.border = element_rect(colour = "grey80", fill = NA, size = 0.5), plot.title = element_text(size = 8))
+
+# Publication map
+pdf("Fig1_global_riparian_stream_kd_map.pdf", width = 7.25, height = 12)
+plot(map)
+print(inset_rc, vp = viewport(width = 0.2, height = 0.12, x = 0.06, y = 0.5725, just = "left"))
+print(inset_rl, vp = viewport(width = 0.2, height = 0.12, x = 0.675, y = 0.5725, just = "left"))
+print(inset_sc, vp = viewport(width = 0.2, height = 0.12, x = 0.06, y = 0.075, just = "left"))
+print(inset_sl, vp = viewport(width = 0.2, height = 0.12, x = 0.675, y = 0.075, just = "left"))
+dev.off()
+```
+
+###GLOBAL DIFFERENCE MAP###
+Global map of stream - riparian cotton kd for publication
+
+##CAPTION## 
+Figure 2. Global map of riparian – stream cotton strip decomposition rates (untransformed Kd). Inset histogram shows the distribution of the difference in values. Note that, because of the higher accuracy of the stream and riparian BRT models, this map was derived from predictions generated separately from the same locations by the riparian and stream BRT models (Fig. 1) rather than from the riparian – stream BRT model directly. 
+
+```{r}
+# Combine stream and riparian Kd rasters dataframes and remove NA cells
+global_kd_diff <- cbind(mask_glkds[,1:3], mask_glkdr[,3:4])
+global_kd_diff <- global_kd_diff[which(global_kd_diff$land == 1), ]
+
+# Turn desert, ice, etc. to NA
+global_kd_diff[which(global_kd_diff$ln.mean.Kd <= -6.10272), 3:4] <- NA
+
+# Make column of stream - riparian Kd
+colnames(global_kd_diff)[3] <- "ln.mean.Kds"
+global_kd_diff$diff <- exp(global_kd_diff$ln.mean.Kds) - exp(global_kd_diff$ln.mean.Kd)
+
+# Make map figures in ggplot 
+map1 <- ggplot() + borders(fill = "floralwhite") + geom_raster(data = global_kd_diff, aes(x = x, y = y, fill = diff)) +  scale_fill_gradientn(colors = rev(heat.colors(10), na.value = "gray90", name = bquote('Stream - Riparian Cellulose K'[d]~" (d"^-1*")"), limits = c(-0.01211553, 0.07330178)) + xlab("") + ylab("") + theme(legend.position = c(0.15, 0.85)), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size=9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "white", size = 1, linetype = "solid"), axis.text.x = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.ticks.x = element_blank(), axis.ticks.y=element_blank(), axis.text.y = element_blank()) 
+
+diffdat <- global_kd_diff[which(!is.na(global_kd_diff$diff)),]
+h <- ggplot(diffdat, aes(x = diff)) + geom_histogram(bins = 10000, color = "orange") + ylim(0, 250) + theme(panel.background = element_rect(fill = "white", colour = "black", size = 1, linetype = "solid"),panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank()) + xlab("") + ylab("")
+
+# Publication map
+pdf("Fig2_global_stream_riparian_kd_diff_map.pdf", width = 7.25, height = 6)
+map1
+print(h, vp = viewport(width = 0.275, height = 0.25, x = 0.005, y = 0.15, just = "left"))
+dev.off()
+```
+
+####CELLDEX RIPARIAN BRT MODEL PARTIAL DEPENDENCE PLOTS###
+Make background maps for predictors for PDPs and export as pngs
+
+```{r}
+# Make grey background of globale land area
+bg <- fasterize(basins, r, field = "tmp_dc_smn")
+bg <- raster::mask(bg, inverse = T, gr2, updateNA = T)
+bg <- raster::mask(bg, inverse = T, gr3, updateNA = T)
+bg <- raster::mask(bg, l, inverse = T, updateNA = T)
+bg <- bg*0
+
+# Mean slope
+basins$slp_dg_uav[which(basins$slp_dg_uav == -999)] <- NA
+slp <- fasterize(basins, r, field = "slp_dg_uav")
+slp <- raster::mask(slp, bg, updateNA = T)
+slp_moll <- projectRaster(slp, crs = "+proj=moll")
+slpm <- as.data.frame(slp_moll, xy=TRUE)
+slpm$trans <- (slpm$layer)/10
+slpm<-slpm[complete.cases(slpm$layer),]
+
+# Mean annual AET
+basins$aet_mm_uyr[which(basins$aet_mm_uyr == -999)] <- NA
+aet <- fasterize(basins, r, field = "aet_mm_uyr")
+aet <- raster::mask(aet, bg, updateNA = T)
+aet_moll <- projectRaster(aet, crs = "+proj=moll")
+aetm <- as.data.frame(aet_moll, xy=TRUE)
+aetm<-aetm[complete.cases(aetm$layer),]
+
+# Cropland % area
+basins$aet_mm_uyr[which(basins$aet_mm_uyr == -999)] <- NA
+aet <- fasterize(basins, r, field = "aet_mm_uyr")
+aet <- raster::mask(aet, bg, updateNA = T)
+aet_moll <- projectRaster(aet, crs = "+proj=moll")
+aetm <- as.data.frame(aet_moll, xy=TRUE)
+aetm<-aetm[complete.cases(aetm$layer),]
+
+# Cropland % area
+basins$crp_pc_use[which(basins$crp_pc_use == -999)] <- NA
+crp <- fasterize(basins, r, field = "crp_pc_use")
+crp <- raster::mask(crp, bg, updateNA = T)
+crp_moll <- projectRaster(crp, crs = "+proj=moll")
+crpm <- as.data.frame(crp_moll, xy=TRUE)
+crpm<-crpm[complete.cases(crpm$layer),]
+
+# AET month
+AET_moll <- cbind(xy_rip, AETmonth = R_stb[,'AETmonth'])
+
+# Temperature month
+temp_moll <- cbind(xy_rip, tempmonth = Rdat[,'tempmonth'])
+
+# Nitrate yield
+NO3 <- resample(NO3, bg)
+NO3 <- raster::mask(NO3, bg, updateNA = T)
+NO3<-raster::mask(NO3, inverse = T, gr2, updatevalue = -1, updateNA=T)
+NO3<-raster::mask(NO3, inverse = T, gr3, updatevalue = -1, updateNA=T)
+NO3_moll <- projectRaster(NO3, crs = "+proj=moll")
+NO3m <- as.data.frame(NO3_moll, xy = TRUE)
+NO3m[which(NO3m$Band_1 < 0), 3] <- NA
+NO3m <- NO3m[complete.cases(NO3m),]
+NO3m$Band_1<-log10(NO3m$Band_1)
+NO3m$Band_1[which(NO3m$Band_1 < -3)] <- -3
+
+# DRP yield
+DRP <- resample(DRP, bg)
+DRP<-raster::mask(DRP, inverse=T, gr2, updatevalue = -1, updateNA = T)
+DRP<-raster::mask(DRP, inverse=T, gr3, updatevalue = -1, updateNA = T)
+DRP_moll<-projectRaster(DRP, crs = "+proj=moll")
+DRPm <- as.data.frame(DRP_moll,xy=TRUE)
+DRPm[which(DRPm$DRP_Conc < 0), 3] <- NA
+DRPm$DRP_Conc<-log10(DRPm$DRP_Conc)
+DRPm$DRP_Conc[which(DRPm$DRP_Conc < -3)] <- -3
+
+# N2P yield
+N2P <- resample(TN2TP, bg)
+N2P<-raster::mask(N2P, inverse=T, gr2, updatevalue = -1, updateNA = T)
+N2P<-raster::mask(N2P, inverse=T, gr3, updatevalue = -1, updateNA = T)
+N2P_moll<-projectRaster(N2P, crs = "+proj=moll")
+N2Pm <- as.data.frame(N2P_moll,xy=TRUE)
+N2Pm$layer<-log10(N2Pm$layer)
+
+# TPI
+tpi <- resample(tpi, bg)
+tpi <- raster::mask(tpi, bg, updateNA = T)
+tpi_moll <- projectRaster(tpi, crs = "+proj=moll")
+tpim <- as.data.frame(tpi_moll, xy = TRUE)
+tpim <- tpim[complete.cases(tpim),]
+tpim <- subset(tpim, tpi_1KMmn_GMTEDmd > 0)
+
+# TNS
+tns <- resample(tns, bg)
+tns <- raster::mask(tns, bg, updateNA = T)
+tns_moll <-projectRaster(tns, crs = "+proj=moll")
+tnsm <-as.data.frame(tns_moll,xy=TRUE)
+
+# OCD
+ocd <- resample(ocd, bg)
+ocd <- raster::mask(ocd, bg, updateNA = T)
+ocd_moll <- projectRaster(ocd, crs = "+proj=moll")
+ocdm<- as.data.frame(ocd_moll, xy = TRUE)
+
+# Soil pH (water)
+sphw <- resample(sphw, bg)
+sphw <- raster::mask(sphw, bg, updateNA = T)
+sphw_moll <- projectRaster(sphw, crs = "+proj=moll")
+sphwm <- as.data.frame(sphw_moll, xy = TRUE)
+
+# Clay
+clay <- resample(clay, bg)
+clay <- raster::mask(clay, bg, updateNA = T)
+clay_moll <- projectRaster(clay, crs = "+proj=moll")
+claym <- as.data.frame(clay_moll, xy = TRUE)
+
+# Sand
+sand <- resample(sand, bg)
+sand <- raster::mask(sand, bg, updateNA = T)
+sand_moll <- projectRaster(sand, crs = "+proj=moll")
+sandm <- as.data.frame(sand_moll, xy = TRUE)
+
+# Total P deposition
+tpd <- resample(TPdepr, bg)
+tpd <- raster::mask(tpd, bg, updateNA = T)
+tpd_moll <- projectRaster(tpd, crs = "+proj=moll")
+tpdm <- as.data.frame(tpd_moll, xy = TRUE)
+tpdm$lyr.1 <- log10(tpdm$lyr.1)
+
+# Elevation
+elev <- resample(elev, bg)
+elev <- raster::mask(elev, bg, updateNA = T)
+elev_moll <-projectRaster(elev, crs = "+proj=moll")
+elevm <- as.data.frame(elev_moll, xy = TRUE)
+elevm[which(elevm$elevation_1KMmn_SRTM == 0), 3] <- NA
+elevm <- elevm[complete.cases(elevm),]
+
+# Mollweide boundaries
+mapx <- c(-18126755, 18137295)
+mapy <- c(-9118252, 9123048)
+
+# Mean daily recorded stream temperature
+xy_stream2<-subset(xy_stream,!is.na(temp))
+png(file="streamtempmap.png",width=4,height=3,units="in",res=300,bg="transparent")
+ggplot(data=xy_stream2,aes(x=x,y=y)) + geom_tile(data = dplyr::filter(mask_glkds, !is.na(land)),aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = temp)) + scale_colour_gradientn(na.value = "grey", colours = turbo(10)) + theme(legend.position = c(0.5,-0.05),legend.direction = "horizontal",
+legend.key.width = unit(0.2,units="npc"),legend.key.height = unit(0.06,units="npc"),legend.background = element_blank(),legend.title = element_blank(),legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Mean daily recorded air temperature
+xy_rip2<-subset(xy_rip,!is.na(temp))
+png(file="riptempmap.png",width=4,height=3,units="in",res=300,bg="transparent")
+ggplot(data=xy_rip2,aes(x=x,y=y)) + geom_tile(data = dplyr::filter(mask_glkds, !is.na(land)),aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = temp)) + scale_colour_gradientn(na.value = "grey", colours = turbo(10)) + theme(legend.position = c(0.5,-0.05),legend.direction = "horizontal",
+legend.key.width = unit(0.2,units="npc"),legend.key.height = unit(0.06,units="npc"),legend.background = element_blank(),legend.title = element_blank(),legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# TNS map
+png(file = "tnsmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_tile(data = tnsm, aes(x = x, y = y, fill = nitrogen_0.5cm)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$tns, na.rm=T), max(Rdat$tns, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Elevation map
+png(file = "elevmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = elevm, aes(x = x, y = y, fill = elevation_1KMmn_GMTEDmn)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = rev(viridis(6)), limits = c(min(Rdat$elev, na.rm=T), max(Rdat$elev, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Cropland map
+png(file = "crpmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = crpm, aes(x = x, y = y, fill = layer)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = rev(viridis(6)), limits = c(min(Sdat$crp_pc_use, na.rm=T), max(Sdat$crp_pc_use, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# OCD map
+png(file = "ocdmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = ocdm, aes(x = x, y = y, fill = ocd_0.5cm)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$ocd, na.rm = T), max(Rdat$ocd, na.rm = T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Clay map
+png(file = "claymap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+claym <-claym[complete.cases(claym),]
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = claym, aes(x = x, y = y, fill = clay_0.5cm_mean)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits =  c(min(Rdat$clay, na.rm = T), max(Rdat$clay, na.rm = T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Sand map
+png(file = "sandmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+sandm <-sandm[complete.cases(sandm),]
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = sandm, aes(x = x, y = y, fill = sand_0.5cm)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits =  c(min(Rdat$sand, na.rm = T), max(Rdat$sand, na.rm = T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Soil pH map
+png(file = "sphwmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+sphwm <-sphwm[complete.cases(sphwm),]
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = sphwm, aes(x = x, y = y, fill = phh2o_0.5cm)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits =  c(min(Rdat$sphw, na.rm = T), max(Rdat$sphw, na.rm = T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# TPI map
+png(file = "tpimap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = tpim, aes(x = x, y = y, fill = log(tpi_1KMmn_GMTEDmd))) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$tpi, na.rm=T), max(Rdat$tpi, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# NO3+NO2 map riparian
+RdatN <- Rdat$log10NO3c[which(Rdat$log10NO3c > -8)]
+png(file = "NO3map.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = NO3m, aes(x = x, y = y, fill = Band_1)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits =  c(min(RdatN, na.rm = T), max(RdatN, na.rm = T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# DRP map
+png(file="DRPmap.png",width=4,height=3,units="in",res=300,bg="transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = DRPm, aes(x = x, y = y, fill = DRP_Conc)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits=c(min(Rdat$log10DRPc, na.rm=T), max(Rdat$log10DRPc, na.rm=T))) +
+theme(legend.position = c(0.5, -0.05), legend.direction = "horizontal",
+legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Total P deposition map
+png(file="TPdmap.png", width=4, height=3, units="in", res=300, bg="transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = tpdm, aes(x = x, y = y, fill = lyr.1)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$log10TPdep, na.rm = T), max(Rdat$log10TPdep, na.rm = T))) +
+theme(legend.position = c(0.5, -0.05), legend.direction = "horizontal",
+legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# TN2TP map
+png(file="N2Pmap.png", width=4, height=3, units="in", res=300, bg="transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = N2Pm, aes(x = x, y = y, fill = layer)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$log10TN2TP, na.rm = T), max(Rdat$log10TN2TP, na.rm = T))) +
+theme(legend.position = c(0.5, -0.05), legend.direction = "horizontal",
+legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Upstream slope map
+png(file="slpmap.png",width=4,height=3,units="in",res=300,bg="transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_tile(data = slpm, aes(x = x, y = y, fill = trans)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = rev(viridis(6)), limits = c(min(Rdat$slope, na.rm=T), max(Rdat$slope, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2,units="npc"),legend.key.height = unit(0.06,units = "npc"),legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# AET month of deployment riparian
+png(file="AETmmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot(data = AET_moll, aes(x = x, y = y)) + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = AETmonth)) + scale_colour_gradientn(na.value = "grey", colours = turbo(10), limits = c(min(Rdat$AETmonth, na.rm=T), max(Rdat$AETmonth, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"),legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# AET month of deployment stream
+png(file="AETmmaps.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot(data = AET_moll, aes(x = x, y = y)) + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = AETmonth)) + scale_colour_gradientn(na.value = "grey", colours = turbo(10), limits = c(min(Sdat$AETmonth, na.rm=T), max(Sdat$AETmonth, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"),legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Mean annual AET upstream
+png(file="AETmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot() + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = aetm, aes(x = x, y = y, fill = layer)) + ylim(mapy) + xlim(mapx) + scale_fill_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Sdat$aet_mm_uyr, na.rm=T), max(Sdat$aet_mm_uyr, na.rm=T))) + theme(legend.position = c(0.5,-0.05), legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), panel.background = element_blank())
+dev.off()
+
+# Tempmonth map riparian
+png(file="tempmmap.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot(data = temp_moll, aes(x = x, y = y)) + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = tempmonth)) + ylim(mapy) + xlim(mapx) + scale_colour_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Rdat$tempmonth, na.rm=T), max(Rdat$tempmonth, na.rm=T))) + theme(legend.position = c(0.5,-0.05),legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),panel.background = element_blank())
+dev.off()
+
+# Precipmonth map stream
+png(file="precmmaps.png", width = 4, height = 3, units = "in", res = 300, bg = "transparent")
+ggplot(data = precip_moll, aes(x = x, y = y)) + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_point(aes(colour = log10precipmonth)) + ylim(mapy) + xlim(mapx) + scale_colour_gradientn(na.value = NA, colours = turbo(10), limits = c(min(Sdat$log10precipmonth, na.rm=T), max(Sdat$log10precipmonth, na.rm=T))) + theme(legend.position = c(0.5,-0.05),legend.direction = "horizontal", legend.key.width = unit(0.2, units = "npc"), legend.key.height = unit(0.06, units = "npc"), legend.background = element_blank(), legend.title = element_blank(), legend.box.just = "bottom") + xlab("") + ylab("") + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),panel.background = element_blank())
+dev.off()
+```
+
+###RIPARIAN CELLDEX PDPs###
+Generate riparian CELLDEX partial dependence plots figure for publication. 
+
+###CAPTION###
+Figure S2. Partial dependence plots of the six most important variables in BRT models of cotton strip decomposition in riparian zones, left column, brown lines, cross-validation pseudo-r2 = 0.91, streams, middle column, blue lines, pseudo-r2 = 0.87, and stream – riparian rates, right column, red lines, pseudo-r2 = 0.68, overlaid on global maps of the distribution of each x-variable – x-axis color bars give the map legend and rugs mark deciles of the data. Note that 1) values of stream NO3-NO2 and DRP yield are log10-transformed, 2) columns are arranged top to bottom by variable importance with y-axis ranges decreasing accordingly, and 3) we restricted the ranges of background maps to match those of the data used to train the models.
+
+```{r}
+# Get grids of x variable values and predictions to make partial dependence plots
+tempmonth <- plot(Rgbm, i.var = 'tempmonth', n.trees = best.iterR, return.grid = T)
+slope <- plot(Rgbm, i.var = 'slp_dg_uav', n.trees = best.iterR, return.grid = T)
+N2P <- plot(Rgbm, i.var = 'log10TN2TP', n.trees = best.iterR, return.grid = T)
+aetmonth <- plot(Rgbm, i.var = 'AETmonth', n.trees = best.iterR, return.grid = T)
+aetmonth$AETmonth <- aetmonth$AETmonth*10
+clay <- plot(Rgbm, i.var = 'clay', n.trees = best.iterR, return.grid = T)
+tpi <- plot(Rgbm, i.var = 'tpi', n.trees = best.iterR, return.grid = T)
+meantemp <- plot(Rgbm, i.var = 'mean_mean_daily_temp_rip', n.trees = best.iterR, return.grid = T)
+
+# Get deciles of the x variable for rug plots
+qs <- seq(0,1,0.1)
+sloperug <- data.frame(rug = quantile(Rdat$slp_dg_uav, probs = qs))
+aetmrug <- data.frame(rug = quantile(Rdat$AETmonth, probs = qs, na.rm = T))
+drprug <- data.frame(rug = quantile(Rdat$log10DRPc, probs = qs, na.rm = T))
+tempmrug <- data.frame(rug = quantile(Rdat$tempmonth, probs = qs, na.rm = T))
+clayrug <- data.frame(rug = quantile(Rdat$clay, probs = qs, na.rm = T))
+tpirug <- data.frame(rug = quantile(Rdat$tpi, probs = qs, na.rm = T))
+mtrug <- data.frame(rug=quantile(Rdat$mean_mean_daily_temp_rip,probs=qs,na.rm=T))
+N2Prug <- data.frame(rug = quantile(Rdat$log10TN2TP, probs = qs, na.rm = T))
+sphwrug <- data.frame(rug = quantile(Rdat$sphw, probs = qs, na.rm = T))
+
+# Load map images 
+AETmmap <- readPNG("AETmmap.png")
+slpmap <- readPNG("slpmap.png")
+tempmmap <- readPNG("tempmmap.png")
+DRPmap <- readPNG("DRPmap.png")
+tpimap <- readPNG("tpimap.png")
+claymap <- readPNG("claymap.png")
+riptempmap <- readPNG("riptempmap.png")
+N2Pmap <- readPNG("N2Pmap.png")
+
+# Make RIPARIAN partial dependence plots in ggplot
+ps1 <- ggplot(data = clay, aes(clay, exp(y))) + ggpubr::background_image(claymap) + geom_line(color = "white", size = 1.5) + geom_line(color = "brown", size = 1) + ylab("") + ggtitle("Riparian") + ylim(0.005,0.013) +  annotate("text", x = min(clay$clay), y = 0.013, label = "A", fontface = "bold") + xlab("Site soil % clay 0-5 cm") + geom_rug(aes(x = rug, y = 0), data = clayrug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(plot.title = element_text(color = "brown", face = "bold"), panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps2 <- ggplot(data = N2P, aes(log10TN2TP, exp(y))) + ggpubr::background_image(N2Pmap) + geom_line(color = "white", size = 1.5) + ylim(0.005,0.013) + geom_line(color = "brown", size = 1) + ylab("") + annotate("text", x = min(N2P$log10TN2TP, na.rm = T), y = 0.013, label = "B", fontface="bold") + xlab("Site total annual molar N:P deposition ratio") + geom_rug(aes(x = rug, y = 0.006), data = N2Prug,col="black", sides = "b",length = unit(0.07,"npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps3 <- ggplot(data = tpi, aes(tpi, exp(y))) + ggpubr::background_image(tpimap) + geom_line(color = "white", size = 1.5) + geom_line(color = "brown", size = 1) + ylab("") + ylim(0.00,0.013) + annotate("text", x = min(tpi$tpi), y = 0.013, label = "C", fontface = "bold") + xlab("Site topographic position index") + geom_rug(aes(x = rug, y = 0), data = tpirug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size = 9))
+
+ps4 <-ggplot(data = meantemp, aes(mean_mean_daily_temp_rip, exp(y))) +
+ggpubr::background_image(riptempmap) + geom_line(color="white", size = 1.5) + geom_line(color = "brown", size = 1) + ylab("") + ylim(0.005,0.013) + xlab(expression(x = "Mean measured daily AIR temp during deployment ("*degree*"C)")) + annotate("text", x = min(meantemp$mean_mean_daily_temp_rip, na.rm = T), y = 0.013, label = "D", fontface="bold") + geom_rug(aes(x = rug, y = 0.0265), data = mtrug, col="black",sides="b", length=unit(0.07, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size=9))
+
+ps5 <- ggplot(data = aetmonth, aes(AETmonth, exp(y))) + ggpubr::background_image(AETmmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "brown", size = 1) + ylab("") + ylim(0.005,0.013) +  annotate("text", x = min(aetmonth$AETmonth), y = 0.013, label = "E", fontface = "bold") + xlab("Mean AET month of deployment (mm)") + geom_rug(aes(x = rug, y = 0), data = aetrug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps6 <- ggplot(data = slope, aes(slp_dg_uav, exp(y))) + ggpubr::background_image(slpmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "brown", size = 1) + ylab("") + ylim(0.005,0.013) +  annotate("text", x = min(slope$slp_dg_uav), y =0.013, label = "F", fontface = "bold") + xlab(expression(x = "Mean slope upstream ("*degree*")")) + geom_rug(aes(x = rug, y = 0), data = sloperug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+# Get grids of x variable values and predictions to make partial dependence plots
+no3s <- plot(Sgbm, i.var = 'log10NO3c', n.trees = best.iterS, return.grid = T)
+no3s <- subset(no3s,log10NO3c > -1.78)
+clays <- plot(Sgbm, i.var = 'clay', n.trees = best.iterS, return.grid = T)
+elev <- plot(Sgbm, i.var = 'elev', n.trees = best.iterS, return.grid = T)
+meantemps <- plot(Sgbm, i.var = 'mean_mean_daily_temp_str', n.trees = best.iterS, return.grid = T)
+ocd <- plot(Sgbm, i.var = 'ocd', n.trees = best.iterS, return.grid = T)
+tns <- plot(Sgbm, i.var = 'tns', n.trees = best.iterS, return.grid = T)
+sphw <- plot(Sgbm, i.var = 'sphw', n.trees = best.iterS, return.grid = T)
+N2Ps <- plot(Sgbm, i.var = 'log10TN2TP', n.trees = best.iterR, return.grid = T)
+
+# Get deciles of the x variable for rug plots
+qs <- seq(0,1,0.1)
+no3rugs <- data.frame(rug=quantile(RdatN, probs = qs, na.rm = T))
+clayrugs <- data.frame(rug=quantile(Sdat$clay, probs = qs, na.rm = T))
+elevrug <- data.frame(rug=quantile(Sdat$elev, probs = qs, na.rm = T))
+ocdrug <- data.frame(rug=quantile(Sdat$ocd, probs = qs, na.rm = T))
+tnsrug <- data.frame(rug=quantile(Sdat$tns, probs = qs, na.rm = T))
+mtrugs <- data.frame(rug=quantile(Sdat$mean_mean_daily_temp,probs=qs,na.rm=T))
+sphwrugs <- data.frame(rug = quantile(Sdat$sphw, probs = qs, na.rm = T))
+N2Prugs <- data.frame(rug=quantile(Sdat$log10TN2TP, probs = qs, na.rm = T))
+
+# Load map images 
+NO3map <- readPNG("NO3map.png")
+elevmap <- readPNG("elevmap.png")
+ocdmap <- readPNG("ocdmap.png")
+tnsmap <- readPNG("tnsmap.png")
+streamtempmap <- readPNG("streamtempmap.png")
+sphwmap <- readPNG("sphwmap.png")
+
+# Stream plots
+ps7 <- ggplot(data = clays, aes(clay, exp(y))) + ggpubr::background_image(claymap) + geom_line(color = "white", size = 1.5) + geom_line(color = "blue", size = 1) + ylab("") + ylim(0.005,0.0235) +  ggtitle("Stream") + xlab("Site soil % clay 0-5 cm") + annotate("text", x = min(clays$clay), y = 0.0235, label = "H", fontface="bold") + geom_rug(aes(x = rug, y = 0.005), data = clayrugs, col="black", sides="b", length=unit(0.07, "npc")) + theme(plot.title = element_text(color = "blue", face = "bold"), panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size=9)) 
+ps8 <-ggplot(data = meantemps, aes(mean_mean_daily_temp_str, exp(y))) +
+ggpubr::background_image(streamtempmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "blue", size = 1) + ylab("") + ylim(0.005,0.0235) +  xlab(expression(x="Mean measured daily STREAM temp during deployment ("*degree*"C)")) + annotate("text", x = min(meantemps$mean_mean_daily_temp_str, na.rm=T), y = 0.0235, label = "I", fontface="bold") + geom_rug(aes(x = rug, y = 0.0265), data = mtrugs, col="black",sides="b", length=unit(0.07, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size=9))
+
+ps9 <- ggplot(data = elev, aes(elev, exp(y))) + ggpubr::background_image(elevmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "blue", size = 1) + ylim(0.005,0.0235) +  ylab("") +  annotate("text", x = 0, y = 0.0235, label = "J", fontface = "bold") + geom_rug(aes(x = rug, y = 0), data = elevrug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + xlab("Site elevation (m)") + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps10 <- ggplot(data = sphw, aes(sphw, exp(y))) + ggpubr::background_image(sphwmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "blue", size = 1) + ylab("") + ylim(0.005,0.0235) +   xlab("Site soil pH (water) 0-5 cm") + annotate("text", x = min(sphw$sphw), y = 0.0235, label = "K", fontface="bold") + geom_rug(aes(x = rug, y = min(sphw$sphw)), data = sphwrugs, col="black", sides="b", length=unit(0.07, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA),axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps11 <- ggplot(data = ocd, aes(ocd, exp(y))) + ggpubr::background_image(ocdmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "blue", size = 1) + ylab("") + ylim(0.005,0.0235) +  xlab(expression("Site soil organic C density 0-5 cm (kg m"^"-3"*")")) + annotate("text", x = min(ocd$ocd), y = 0.0235, label = "L", fontface="bold") + geom_rug(aes(x = rug, y = 0.005), data = ocdrug, col="black", sides="b", length=unit(0.07, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA),axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps12 <- ggplot(data = N2Ps, aes(log10TN2TP, exp(y))) + ggpubr::background_image(N2Pmap) + geom_line(color = "white", size = 1.5) + ylim(0.005,0.0235) + geom_line(color = "blue", size = 1) + ylab("") + annotate("text", x = min(N2Ps$log10TN2TP, na.rm = T), y = 0.0235, label = "M", fontface="bold") + xlab("Site total annual molar N:P deposition ratio") + geom_rug(aes(x = rug, y = 0.012), data = N2Prugs, col = "black", sides = "b", length = unit(0.07,"npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+# Get grids of x variable values and predictions to make partial dependence plots
+meantempds <- plot(Dgbm, i.var = 'mean_mean_daily_temp_str', n.trees = best.iterD, return.grid = T)
+meantempdr <- plot(Dgbm, i.var = 'mean_mean_daily_temp_rip', n.trees = best.iterD, return.grid = T)
+no3d<- plot(Dgbm, i.var = 'log10NO3c', n.trees = best.iterD, return.grid = T)
+no3d <- subset(no3d,log10NO3c > -1.78)
+aetmonthd <- plot(Dgbm, i.var = 'AETmonth', n.trees = best.iterD, return.grid = T)
+aet <- plot(Dgbm, i.var = 'aet_mm_uyr', n.trees = best.iterD, return.grid = T)
+crp <- plot(Dgbm, i.var = 'crp_pc_use', n.trees = best.iterD, return.grid = T)
+ocdd <- plot(Dgbm, i.var = 'ocd', n.trees = best.iterD, return.grid = T)
+TPdepd <- plot(Dgbm, i.var = 'log10TPdep', n.trees = best.iterD, return.grid = T)
+
+# Get deciles of the x variable for rug plots
+qs <- seq(0,1,0.1)
+aetmrugs <- data.frame(rug = quantile(Sdat$AETmonth, probs = qs, na.rm = T))
+crprug <- data.frame(rug = quantile(Sdat$crp_pc_use, probs = qs, na.rm = T))
+aetrug <- data.frame(rug = quantile(Sdat$aet_mm_uyr, probs = qs, na.rm = T))
+sandrug <- data.frame(rug = quantile(Sdat$sand, probs = qs, na.rm = T))
+TPdrug <- data.frame(rug = quantile(Sdat$log10TPdep, probs = qs, na.rm = T))
+
+# Load map images 
+NO3map <- readPNG("NO3map.png")
+crpmap <- readPNG("crpmap.png")
+AETmap <- readPNG("AETmap.png")
+AETmmaps <- readPNG("AETmmaps.png")
+TPdmap <- readPNG("TPdmap.png")
+
+ps13 <- ggplot(data = meantempdr, aes(mean_mean_daily_temp_rip, exp(y))) +
+ggpubr::background_image(riptempmap) + geom_line(color="white", size = 1.5) + geom_line(color = "red", size = 1) + ylim(min(exp(meantempdr$y)), max(exp(meantempdr$y))) + ylab("") + ggtitle("Stream - Riparian") + xlab(expression(x = "Mean measured daily AIR temp during deployment ("*degree*"C)")) + annotate("text", x = min(meantempdr$mean_mean_daily_temp_rip, na.rm=T), y = 1.05, label = "N", fontface = "bold") + geom_rug(aes(x = rug, y = min(meantempdr$mean_mean_daily_temp)), data = mtrugs, col = "black", sides = "b", length = unit(0.07, "npc")) + theme(plot.title = element_text(color = "red", face = "bold"), panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size = 9))
+
+ps14 <- ggplot(data = no3d, aes(log10NO3c, exp(y))) + ggpubr::background_image(NO3map) + geom_line(color = "white", size = 1.5) + geom_line(color = "red", size = 1) + ylab("") + ylim(min(exp(no3d$y)), max(exp(no3d$y))) +  xlab(expression("Site stream NO"[3]*"+NO"[2]~"yield (kg ha"^"-1"~"yr"^"-1"*")")) + geom_rug(aes(x = rug, y = min(no3d$log10NO3c)), data = no3rugs, col = "black", sides = "b", length = unit(0.07, "npc")) + annotate("text", x = min(RdatN, na.rm = T), y = 1.05, label = "O", fontface = "bold") + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9)) 
+
+ps15 <- ggplot(data = meantempds, aes(mean_mean_daily_temp_str, exp(y))) +
+ggpubr::background_image(riptempmap) + geom_line(color="white", size = 1.5) + geom_line(color = "red", size = 1) + ylim(min(exp(meantempds$y)), max(exp(meantempds$y))) + ylab("") + xlab(expression(x = "Mean measured daily STREAM temp during deployment ("*degree*"C)")) + annotate("text", x = min(meantempds$mean_mean_daily_temp_str, na.rm=T), y = 1.05, label = "P", fontface = "bold") + geom_rug(aes(x = rug, y = min(meantempdr$mean_mean_daily_temp)), data = mtrugs, col="black",sides = "b", length=unit(0.07, "npc")) + theme(plot.title = element_text(color = "red"), panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text = element_text(size = 9))
+
+ps16 <- ggplot(data = aet, aes(aet_mm_uyr, exp(y))) + ggpubr::background_image(AETmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "red", size = 1) + ylab(bquote('Stream - Riparian raw cellulose decomposition rate (K'[d]~" d"^-1*")")) + ylim(min(exp(aet$y)), max(exp(aet$y))) + annotate("text", x = min(aet$aet_mm_uyr), y = -1.05, label = "Q", fontface = "bold") + xlab("Mean annual AET upstream (mm)") + geom_rug(aes(x = rug, y = 0), data = aetrug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(hjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps17 <- ggplot(data = aetmonthd, aes(AETmonth, exp(y))) + ggpubr::background_image(AETmmaps) + geom_line(color = "white", size = 1.5) + geom_line(color = "red", size = 1) + ylab("") + ylim(min(exp(aetmonthd$y)), max(exp(aetmonthd$y))) + annotate("text", x = min(aetmonthd$AETmonth), y = 1.05, label = "R", fontface = "bold") + xlab("Mean AET month of deployment (mm)") + geom_rug(aes(x = rug, y = 0), data = aetmrugs, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+ps18 <- ggplot(data = TPdepd, aes(log10TPdep, exp(y))) + ggpubr::background_image(TPdmap) + geom_line(color = "white", size = 1.5) + geom_line(color = "red", size = 1) + ylab("") + ylim(min(exp(TPdepd$y)), max(exp(TPdepd$y))) + annotate("text", x = min(TPdepd$log10TPdep), y = 1.05, label = "S", fontface = "bold") + xlab(expression("Site total annual P deposition (kg ha"^"-1"~"yr"^"-1"*")")) + geom_rug(aes(x = rug, y = 0), data = TPdrug, col = "black", position = "jitter", sides = "b", length = unit(0.08, "npc")) + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title.x = element_text(vjust = -0.5), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.title = element_text(size = 9), axis.text=element_text(size = 9))
+
+# Make trellis of the top 6 partial dependence plots
+pdf(file = "FigS2_Riparian_stream_celldex_pdps.pdf", width = 12, height = 16)
+grid.arrange(ps1, ps7, ps13, ps2, ps8, ps14, ps3, ps9, ps15, ps4, ps10, ps16, ps5, ps11, ps17, ps6, ps12, ps18, ncol = 3, left = textGrob(bquote('Cellulose decomposition rate (K'[d]~" d"^-1*")"), vjust = 1.5, rot = 90, gp = gpar(fontsize = 9)))
+dev.off()
+```
+
+###GLOBAL CLAY % 0-5 CM SOIL MAP###
+Global map of stream - riparian cotton kd for publication
+
+##CAPTION## 
+Figure X. Global map of soil % clay in the top 0-5 cm of the soil profile.
+
+```{r}
+# Remove NA cells
+claym <-claym[complete.cases(claym),]
+aetm <-aetm[complete.cases(aetm),]
+
+# Make map figures in ggplot 
+map1 <- ggplot() + borders(fill = "floralwhite") + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = claym, aes(x = x, y = y, fill = clay_0.5cm_mean)) +  scale_fill_gradientn(colors = turbo(10), na.value = "gray90", name = "Mean soil % clay 0-5 cm") + xlab("") + ylab("") + theme(legend.position = c(0.125, 0.85), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size=9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "white", size = 1, linetype = "solid"), axis.text.x = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.ticks.x = element_blank(), axis.ticks.y=element_blank(), axis.text.y = element_blank()) 
+
+h <- ggplot(claym, aes(x = clay_0.5cm_mean)) + geom_histogram(bins = 10000, color = "tan") + theme(panel.background = element_rect(fill = "white", colour = "black", size = 1, linetype = "solid"),panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank()) + xlab("") + ylab("")
+
+map2 <- ggplot() + borders(fill = "floralwhite") + geom_tile(data = dplyr::filter(mask_glkdr, !is.na(land)), aes(x = x, y = y), fill = "grey90") + geom_raster(data = aetm, aes(x = x, y = y, fill = layer)) +  scale_fill_gradientn(colors = turbo(10), na.value = "gray90", name = "Mean annual actual evapotranpiration (AET) in mm") + xlab("") + ylab("") + theme(legend.position = c(0.225, 0.86), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size=9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "white", size = 1, linetype = "solid"), axis.text.x = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.ticks.x = element_blank(), axis.ticks.y=element_blank(), axis.text.y = element_blank()) 
+
+h2 <- ggplot(aetm, aes(x = layer)) + geom_histogram(bins = 10000, color = "tan") + theme(panel.background = element_rect(fill = "white", colour = "black", size = 1, linetype = "solid"),panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank()) + xlab("") + ylab("")
+
+# Publication map
+pdf("global_clay_aet_map.pdf", width = 7.25, height = 12)
+grid.arrange(map2, map1, ncol = 1)
+print(h2, vp = viewport(width = 0.275, height = 0.125, x = 0.0035, y = 0.55, just = "left"))
+print(h, vp = viewport(width = 0.275, height = 0.125, x = 0.0035, y = 0.05, just = "left"))
+dev.off()
+```
+
+###CALCULATE AND PLOT INTERACTION STRENGTHS###
+Of important variables in both stream and riparian models
+
+###CAPTION/METHODS###
+Figure S4. Networks showing the strongest interactions (top percentile of interaction strengths) of the variables in the top percentile of relative importance as determined by permutation tests (Breiman 1999) in the riparian, top, and stream, middle, and stream – riparian, bottom, CELLDEX Kd BRT models. The green legend indicates relative variable importance, the blue, interaction strength. Note that the top variable in importance in the stream BRT model is mean daily stream temperature during deployment, whereas in the riparian BRT model, minimum annual temperature is also in the top percentile of relative importance; and that the strongest interactors of the most important variables are variables with lower relative importance.
+
+```{r}
+# Calculate interaction strengths for stream GBM model
+viviGBstS <- vivi(fit = Sgbm,
+                 data = Sdat,
+                 response = "logk",
+                 reorder = FALSE,
+                 normalized = FALSE,
+                 predictFun = predict.gbm)
+
+# Filter network for stream GBM model
+set.seed(15)
+intVals <- viviGBstS
+diag(intVals) <- NA 
+
+# Set thresholds for importance and interaction strength and filter by both
+impThresh <- quantile(diag(viviGBstS),0.8,na.rm=TRUE)
+intThresh <- quantile(intVals,0.9999,na.rm=TRUE)
+sv <- which(diag(viviGBstS) > impThresh |
+              apply(intVals, 1, max, na.rm=TRUE) > intThresh)
+viviGBstS2<-viviGBstS[sv,sv]
+
+# Calculate interaction strengths for riparian GBM model
+viviGBstR <- vivi(fit = Rgbm,
+                 data = Rdat,
+                 response = "logk",
+                 reorder = FALSE,
+                 normalized = FALSE,
+                 predictFun = predict.gbm)
+
+# Filter network for riparian GBM model
+set.seed(15)
+intVals <- viviGBstR
+diag(intVals) <- NA 
+
+# Set thresholds for importance and interaction strength and filter by both
+impThresh <- quantile(diag(viviGBstR),0.8,na.rm=TRUE)
+intThresh <- quantile(intVals,0.9999,na.rm=TRUE)
+sv <- which(diag(viviGBstR) > impThresh |
+              apply(intVals, 1, max, na.rm=TRUE) > intThresh)
+viviGBstR2<-viviGBstR[sv,sv]
+
+# Calculate interaction strengths for difference GBM model
+viviGBstD <- vivi(fit = Dgbm,
+                 data = Ddat,
+                 response = "diff",
+                 reorder = FALSE,
+                 normalized = FALSE,
+                 predictFun = predict.gbm)
+
+# Filter network for riparian GBM model
+set.seed(15)
+intVals <- viviGBstD
+diag(intVals) <- NA 
+
+# Set thresholds for importance and interaction strength and filter by both
+impThresh <- quantile(diag(viviGBstD),0.8,na.rm=TRUE)
+intThresh <- quantile(intVals,0.9999,na.rm=TRUE)
+sv <- which(diag(viviGBstD) > impThresh |
+              apply(intVals, 1, max, na.rm=TRUE) > intThresh)
+viviGBstD2<-viviGBstD[sv,sv]
+
+# Plot interaction networks of top variables
+str_net<-viviNetwork(viviGBstS2, layout = igraph::layout_in_circle,removeNode = TRUE)
+rip_net<-viviNetwork(viviGBstR2, layout = igraph::layout_in_circle,removeNode = TRUE)
+dif_net<-viviNetwork(viviGBstD2, layout = igraph::layout_in_circle,removeNode = TRUE)
+
+# Publication figures
+pdf(file = "FigS4_Stream_interaction_network.pdf", width=10, height=10)
+str_net
+dev.off()
+pdf(file = "FigS4_Riparian_interaction_network.pdf", width=10, height=10)
+rip_net
+dev.off()
+pdf(file = "FigS4_Difference_interaction_network.pdf", width=10, height=10)
+dif_net
+dev.off()
+```
+
+###Bivariate PDPs of major interactions###
+Make 2-way partial dependence plots of the major interactions above. Generate side by side vertical partial dependence plots of the major interactions from the stream and riparian BRT models.
+
+```{r}
+# Combine lat-long coords from R_stb with Rdat
+repsites <- cbind(S_stb[, 8:9], Sdat, Ddat[,1:2])
+repsites <- repsites[, c(1:2, 4, 6:7, 40, 52:54)]
+repsites <- repsites[complete.cases(repsites), ]
+
+# Randomly pull 10 CELLDEX sites
+set.seed(17)
+samp <- sample(nrow(repsites), size = 20)
+repsites <- repsites[samp,]
+repsites$label <- seq(1, nrow(repsites))
+rownames(repsites) <- repsites$label
+
+# Choose 3 with contrasting values for evironmental variables
+repsites <- repsites[c(14,15,19),]
+
+# Make fields for location names and corresponding labels
+repsites$place <- c("Cole Creek, Michigan, USA", "Onion Creek, Texas, USA", "Rio Salvador, Orellana, Ecuador")
+# add label column
+repsites$label <- c("M", "T", "E")
+```
+
+###CAPTION###
+Figure 5. Comparison of the bivariate partial dependence plots of variables in the top percentile of two-way interaction strengths of the variables that are also in the top percentile of relative importance determined via permutation tests (Breiman 1999) in the riparian, left, and stream, right, cotton strip BRT models. Note that the top variable in importance in the stream BRT model is mean daily stream temperature during deployment, whereas in the riparian BRT model, minimum annual temperature is also in the top percentile of relative importance. Also note  that the strongest interactions of the most important variables are with variables with lower relative importance. Stream temperature was measured at CELLDEX sample sites, whereas, unless labeled "Upstream", all other variables correspond to the HydroBASINS HUC-12 subwatershed level.
+
+Make data grids for bivariate pdps.
+
+```{r}
+##RIPARIAN##
+aetmcly <- partial(object = Rgbm, pred.var = c("AETmonth", "clay"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterR)
+
+ratcly <- partial(object = Rgbm, pred.var = c("log10TN2TP", "clay"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterR)
+
+srnpr <- partial(object = Rgbm, pred.var = c("sr", "log10TN2TP"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterR)
+
+ggplot() + geom_tile(data = srnpr, aes(x = sr, y = log10TN2TP, fill = yhat), color = NA) + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "")
+
+##STREAM##
+srnp <- partial(object = Sgbm, pred.var = c("sr", "log10TN2TP"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterS)
+
+ggplot() + geom_tile(data = srnp, aes(x = sr, y = log10TN2TP, fill = yhat), color = NA) + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "")
+
+phwtmp <- partial(object = Sgbm, pred.var = c("sphw", "mean_mean_daily_temp_str"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterS)
+
+ratclyS <- partial(object = Sgbm, pred.var = c("log10TN2TP", "clay"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterS)
+
+# Difference
+phwtmpds <- partial(object = Dgbm, pred.var = c("sphw", "mean_mean_daily_temp_str"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterD)
+
+phwtmpdr <- partial(object = Dgbm, pred.var = c("sphw", "mean_mean_daily_temp_rip"), grid.resolution = 200, chull = TRUE, rug = T, n.trees = best.iterD)
+```
+
+Make bivariate pdps of key interactions in all 3 CELLDEX BRT models and plot.
+
+```{r}
+###RIPARIAN###
+# Soil clay % vs AET month of deployment
+ps19 <- ggplot() + geom_tile(data = aetmcly, aes(x = clay, y = AETmonth, fill = yhat), color = NA) + xlim(0, 55) + ggtitle("Riparian") + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + xlab("") + ylab(expression(x="Mean AET during month of deployment (mm)")) + annotate("text", x = 0, y = max(aetmcly$AETmonth), label = "A", fontface="bold") + geom_rug(aes(x = rug, y = -3), data = clayrug, col="black", sides="b", length = unit(0.07, "npc")) + geom_rug(aes(y = rug), data = aetmrug, sides = "r", length = unit(0.03, "npc")) + geom_label(data = repsites, aes(x = clay, y = AETmonth, label = label)) + theme(plot.title = element_text(color = "brown", size = 16, face = "bold"), legend.position = c(0.9, 0.3), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank()) 
+
+ps20 <- ggplot() + geom_tile(data = ratcly, aes(x = clay, y = log10TN2TP, fill = yhat), color = NA) + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + xlab("Site soil % clay 0-5 cm") + ylab(expression(x="Total N: Total P deposition (molar)")) + annotate("text", x = 0, y = max(ratcly$log10TN2TP), label = "B", fontface="bold") + geom_rug(aes(x=45, y = rug), data = N2Prug, sides = "r", length = unit(0.03, "npc")) + geom_rug(aes(x = rug, y = 3.5), data = clayrug, col="black", sides="b", length = unit(0.07, "npc")) + geom_label(data = repsites, aes(x = clay, y = log10TN2TP, label = label)) + theme(axis.title.x = element_text(hjust = 1.25), plot.title = element_text(color = "brown", size = 16, face = "bold"), legend.position = c(0.9, 0.3), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9)) + theme(panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank()) 
+
+###STREAM###
+# Soil pH % vs mean measured daily stream temperature
+ps21 <- ggplot() + geom_tile(data = phwtmp, aes(x = sphw, y = mean_mean_daily_temp_str, fill = yhat), color = NA) + ggtitle("Stream") + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + ylab(expression(x = "Mean daily stream temperature during deployment ("*degree*"C)")) + xlab("Site soil pH (water) 0-5 cm") + annotate("text", x = 4, y = max(phwtmp$mean_mean_daily_temp_str), label = "C", fontface="bold") + geom_rug(aes(x = rug, y = 0), data = sphwrugs, col="black", sides="b", length = unit(0.07, "npc")) + geom_rug(aes(y = rug), data = mtrugs, sides = "r", length = unit(0.03, "npc")) + geom_label(data = repsites, aes(x = sphw, y = mean_mean_daily_temp_str, label = label)) + theme(axis.title.x = element_text(hjust = 1.25), plot.title = element_text(color = "blue", size = 16, face = "bold"), legend.position = c(0.9, 0.8), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank())
+
+ps22 <- ggplot() + geom_tile(data = ratclyS, aes(x = clay, y = log10TN2TP, fill = yhat), color = NA) + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + geom_rug(aes(y = rug), data = N2Prugs, sides = "r", length = unit(0.03, "npc")) + geom_rug(aes(x = rug, y = 3.5), data = clayrugs, col="black", sides="b", length = unit(0.07, "npc")) + ylab("") + xlab("") + annotate("text", x = 0, y = max(ratclyS$log10TN2TP), label = "D", fontface="bold") + geom_label(data = repsites, aes(x = clay, y = log10TN2TP, label = label)) + theme(plot.title = element_text(color = "brown", size = 16, face = "bold"), legend.position = c(0.9, 0.8), plot.background = element_rect(fill = "transparent", colour = NA), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank())
+
+###DIFFERENCE###
+# Soil pH % vs mean measured daily stream temperature
+ps23 <- ggplot() + geom_tile(data = phwtmpds, aes(x = sphw, y = mean_mean_daily_temp_str, fill = yhat), color = NA) + ggtitle("Stream - Riparian") + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + xlab("") + ylab("") + annotate("text", x = 4, y = max(phwtmpds$mean_mean_daily_temp_str), label = "E", fontface = "bold") + geom_rug(aes(x = rug, y = 0), data = sphwrugs, col="black", sides="b", length = unit(0.07, "npc")) + geom_rug(aes(y = rug), data = mtrugs, sides = "r", length = unit(0.03, "npc")) + geom_label(data = repsites, aes(x = sphw, y = mean_mean_daily_temp_str, label = label)) + theme(plot.background = element_rect(fill = "transparent", colour = NA), plot.title = element_text(color = "red", size = 16, face = "bold"), legend.position = c(0.9, 0.8), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank())
+
+ps24 <- ggplot() + geom_tile(data = phwtmpdr, aes(x = sphw, y = mean_mean_daily_temp_rip, fill = yhat), color = NA) + scale_fill_gradientn(colors = viridis(40), na.value = NA, name = "") + xlab("Site soil pH (water) 0-5 cm") + ylab(expression(x = "Mean daily air temperature during deployment ("*degree*"C)")) + annotate("text", x = 4, y = max(phwtmpdr$mean_mean_daily_temp_rip), label = "F", fontface = "bold") + geom_rug(aes(x = rug, y = 0), data = sphwrugs, col="black", sides="b", length = unit(0.07, "npc")) + geom_rug(aes(y = rug), data = mtrug, sides = "r", length = unit(0.03, "npc")) + geom_label(data = repsites, aes(x = sphw, y = mean_mean_daily_temp_str, label = label)) + theme(plot.title = element_text(color = "red", size = 16, face = "bold"), legend.position = c(0.9, 0.8), legend.box.background = element_blank(), legend.background = element_blank(), legend.title = element_text(size = 9), legend.text = element_text(size = 9), panel.background = element_rect(fill = "white", colour = "black", size = 0.5, linetype = "solid"), panel.grid.minor = element_blank())
+
+# Make 2 column trellis plot of major variable interactions for each model
+pdf(file = "FigS3_2way_interactions_riparian_stream.pdf", width = 18, height = 10)
+grid.arrange(ps19, ps21, ps23, ps20, ps22, ps24, ncol = 3)
+dev.off()
+```
+
+###PARTIAL DEPENDENCE PLOTS FOR RIPARIAN BRT VALIDATION MODEL###
+##CAPTION##
+Figure S3. Partial dependence plots from the BRT model (pseudo-R2 = 0.82) validating the predictions of the CELLDEX riparian BRT model against independent data on litter decomposition (Wu et al., 2020; n = 5096 after mangrove litter and woody material excluded). 
+
+```{r}
+# Get grids of x variable values and predictions to make partial dependence plots
+lnpredk <- plot(Lgbm, i.var = 'ln_pred_k', n.trees = best.iterL, return.grid = TRUE)
+c2n <- plot(Lgbm, i.var = 'Initial.C.N', n.trees = best.iterL, return.grid = TRUE)
+c <- plot(Lgbm, i.var = 'Initial.C', n.trees = best.iterL, return.grid = TRUE)
+n <- plot(Lgbm, i.var = 'Initial.N', n.trees = best.iterL, return.grid = TRUE)
+
+# Get deciles of the x variable for rug plots
+qs <- seq(0,1,0.1)
+kdrug <- data.frame(rug = quantile(litter$ln_pred_k, probs = qs, na.rm = T))
+c2nrug <- data.frame(rug = quantile(litter$Initial.C.N, probs = qs, na.rm = T))
+crug <- data.frame(rug = quantile(litter$Initial.C, probs = qs, na.rm = T))
+nrug <- data.frame(rug = quantile(litter$Initial.N, probs = qs, na.rm = T))
+
+pvr1 <- ggplot(data = lnpredk, aes(ln_pred_k, exp(y))) + geom_rug(aes(x = rug, y = 0), data = kdrug, col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylab("") + ggtitle("Riparian") + xlab(bquote('ln Predicted cellulose decomposition rate (K'[d]~" d"^-1*")")) + ylim(min(exp(lnpredk$y)), max(exp(lnpredk$y))) + annotate("text", x = min(lnpredk$ln_pred_k), y = max(exp(lnpredk$y)), label = "A", fontface = "bold") + theme(axis.title.x = element_text(hjust = 1.75), plot.title = element_text(color = "brown", size = 16, face = "bold"), panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA),axis.line = element_line(colour = "black"), axis.title = element_text(size = 9), axis.text=element_text(size = 9), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+pvr2 <- ggplot(data = n, aes(n$Initial.N, exp(y))) + geom_rug(aes(x = rug, y = 0), data = nrug, col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylab("") + ylim(min(exp(n$y)), max(exp(n$y))) + ylab("") + xlab("Litter N content") + annotate("text", x = min(n$Initial.N), y = max(exp(n$y)), label = "B", fontface = "bold") +  theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.text.x = element_text(vjust = -2), axis.title.x = element_text(vjust = -0.5), axis.title = element_text(size = 9), axis.text=element_text(size = 9), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+pvr3 <- ggplot(data = c2n, aes(Initial.C.N, exp(y))) + geom_rug(aes(x = rug, y = 0), data = c2nrug, position = "jitter", col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylab("") + xlab("Litter initial C:N") + ylim(min(exp(c2n$y)), max(exp(c2n$y))) + annotate("text", x = min(c2n$Initial.C.N), y = max(exp(c2n$y)), label = "C", fontface = "bold") + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.text.x = element_text(vjust = -2), axis.title.x = element_text(vjust=-0.5), axis.title = element_text(size = 9), axis.text = element_text(size = 9), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+pvr4 <- ggplot(data = c, aes(Initial.C, exp(y))) + geom_rug(aes(x = rug, y = 0), data = crug, col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylab("") + ylab("") + xlab("Litter C content") + ylim(min(exp(c$y)), max(exp(c$y))) + annotate("text", x = min(c$Initial.C), y = max(exp(c$y)), label = "D", fontface = "bold") + theme(panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA),axis.line = element_line(colour = "black"), axis.text.x = element_text(vjust = -2), axis.title.x = element_text(vjust = -0.5), axis.title = element_text(size = 9), axis.text=element_text(size = 9), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+Figure S3. Partial dependence plots of the BRT model validating the predictions of the CELLDEX riparian BRT model (left, cross-validation pseudo-r2 = 0.94) against independent data on terrestrial litter Kd  (Wu et al. 2020,  n = 5096); and validating the CELLDEX stream BRT model (right, pseudo-r2 = 0.78) against independent data on leaf litter Kd (Leroy et al. 2020,  n = 895) – x-axis rugs indicate deciles of the predictors. The top explanatory variable in both models: predicted cotton strip decomposition rates from the CELLDEX BRT models, followed by attributes related to litter quality. LOESS smooths (locally estimated scatterplot smoothing, Cleveland et al. 1992, 95% confidence intervals in gray) capture broad patterns of environmental controls on litter Kd, A and E, and similarly the broad effect of leaf quality, B-D and F-H; whereas the unsmoothed thin lines track the variability in the effect of environmental conditions on Kd due to variation in leaf quality (i.e., only certain leaf types were used in certain regions), and, conversely, the variability in the effect of leaf quality variables on Kd due to variation in environmental conditions. In the stream plot, the effect of predicted cotton strip decomposition on litter decomposition, Kd values from coarse litter bags, which allow invertebrates, red, those from fine mesh litter bags which only microbial decomposition only, blue.
+
+```{r}
+# Get grids of x variable values and predictions to make partial dependence plots
+lnpredkS <- plot(LgbmS, i.var = c('ln_pred_k','Mesh.size'), n.trees = best.iterLS, return.grid = TRUE)
+lig <- plot(LgbmS, i.var = c('Lignin_Litter_Mn'), n.trees = best.iterLS, return.grid = TRUE)
+cell <- plot(LgbmS, i.var = c('Cellulose_Litter_Mn'), n.trees = best.iterLS, return.grid = TRUE)
+n2p <- plot(LgbmS, i.var = c('NtoP_Litter_Mn'), n.trees = best.iterLS, return.grid = TRUE)
+
+# Get deciles of the x variable for rug plots
+qs <- seq(0,1,0.1)
+kdrugS <- data.frame(rug = quantile(litterS$ln_pred_k, probs = qs, na.rm=T))
+cellrug <- data.frame(rug = quantile(litterS$Cellulose_Litter_Mn, probs = qs, na.rm=T))
+ligrug <- data.frame(rug = quantile(litterS$Lignin_Litter_Mn, probs = qs, na.rm=T))
+n2prug <- data.frame(rug = quantile(litterS$NtoP_Litter_Mn, probs = qs, na.rm=T))
+
+# Make partial dependence plots in ggplot
+cols<-c("brown","dodgerblue")
+pvs1 <- ggplot(data = lnpredkS, aes(ln_pred_k, exp(y))) + geom_rug(aes(x = rug, y = 0), data = kdrugS, col = "black", sides = "b", length = unit(0.07, "npc")) + ylim(min(exp(lnpredkS$y)), max(exp(lnpredkS$y))) + geom_smooth(aes(color = Mesh.size), method = "loess") + geom_smooth(aes(color = Mesh.size), method = "loess") + geom_line(aes(color = Mesh.size), linetype = 1, alpha = 0.25, linewidth = 0.25) + ylab("") + scale_color_manual(values = cols, labels = c("Detritivore+Microbe", "Microbe")) + xlab("") + annotate("text", x = min(lnpredkS$ln_pred_k), y = max(exp(lnpredkS$y)), label = "E", fontface = "bold")  + ggtitle("Stream") + guides(linetype = guide_legend(ncol = 1)) + guides(color = guide_legend(ncol = 2)) + theme(plot.background = element_rect(fill = "transparent", colour = NA), plot.title = element_text(color = "blue", size = 16, face = "bold"), panel.background = element_rect(fill = "transparent", colour = NA), axis.line = element_line(colour = "black"), axis.title = element_text(size = 9), axis.text = element_text(size=9), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = c(0.5, 0.95), legend.background = element_rect(fill = "transparent", colour = NA), legend.title = element_blank()) + annotation_logticks(sides = "b", outside = T) 
+
+pvs2 <- ggplot(data = lig, aes(Lignin_Litter_Mn, exp(y))) + geom_rug(aes(x = rug, y = 0), data = ligrug, position = "jitter", col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylim(0.0055, max(exp(lig$y))) + ylab("") + xlab("Litter lignin (% dry mass)") + annotate("text", x = min(lig$Lignin_Litter_Mn), y = max(exp(lig$y)), label = "F", fontface = "bold") + theme(legend.position = "none", panel.background = element_rect(fill = "transparent", colour = NA),  plot.background = element_rect(fill = "transparent", colour = NA), axis.title = element_text(size = 9), axis.text = element_text(size = 9), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+pvs3 <- ggplot(data = cell, aes(Cellulose_Litter_Mn, exp(y))) + geom_rug(aes(x = rug, y = 0), data = cellrug, position = "jitter", col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + ylim(min(exp(cell$y)), max(exp(cell$y))) + ylab("") + xlab("Litter cellulose (% dry mass)") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + annotate("text", x = min(cell$Cellulose_Litter_Mn), y = 0.0145, label = "G", fontface = "bold") + theme(legend.position = "none", panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.title = element_text(size = 9), axis.text = element_text(size=9), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank()) 
+
+pvs4 <- ggplot(data = n2p, aes(NtoP_Litter_Mn, exp(y))) + geom_rug(aes(x = rug, y = 0), data = n2prug, position = "jitter", col = "black", sides = "b", length = unit(0.07, "npc")) + geom_smooth(method = "loess") + geom_line(linetype = 1, alpha = 0.25, linewidth = 0.25) + ylim(0.009, 0.0145) + ylab("") + xlab("N:P ratio (molar)") + annotate("text", x = min(n2p$NtoP_Litter_Mn), y = 0.0145, label = "H", fontface = "bold") + theme(legend.position = "none", panel.background = element_rect(fill = "transparent", colour = NA), plot.background = element_rect(fill = "transparent", colour = NA), axis.title = element_text(size = 9), axis.text = element_text(size = 9), axis.line = element_line(colour = "black"), panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+# Make trellis of the top 4 partial dependence plots
+pdf(file = "FigS3_riparian_stream_validation_pdps.pdf", width = 12, height = 14)
+grid.arrange(pvr1, pvs1, pvr2, pvs2, pvr3, pvs3, pvr4, pvs4, ncol = 2, left = textGrob(bquote('Litter decomposition rate (K'[d]~" d"^-1*")"), rot = 90, gp = gpar(fontsize = 9)))
+dev.off()
+```
+
+Save workspace.
+
+```{r}
+save.image("ripstr_rev.Rdata")
+```
