@@ -1,0 +1,19 @@
+Variables,Source
+logk,LeRoy 2020
+Mesh.size,LeRoy 2020
+Leaf.condition,LeRoy 2020
+ln_pred_k,CELLDEX model
+N_Leaf_Mn,TRY
+P_Leaf_Mn,TRY
+NtoP_Leaf_Mn,TRY
+Thick_Mn,TRY
+C_Leaf_Mn,TRY
+CtoN_Leaf_Mn,TRY
+Ca_Leaf_Mn,TRY
+N_Litter_Mn,Lit review
+C_Litter_Mn,Lit review
+P_Litter_Mn,Lit review
+Lignin_Litter_Mn,Lit review
+Cellulose_Litter_Mn,Lit review
+CtoN_Litter_Mn,Lit review
+NtoP_Litter_Mn,Lit review
