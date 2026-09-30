@@ -433,7 +433,10 @@ p_season <- ggplot(season_df,
     x = "Wet vs Dry effect on kd (ratio)",
     y = NULL,
     color = NULL,
-    caption = "Thick bars: 50% CI (unadjusted); thin whiskers: 95% CI (Bonferroni-adjusted, 6 comparisons)"
+    caption = paste0(
+      "Thick bars: 50% CI (unadjusted)\n",
+      "Thin whiskers: 95% CI (Bonferroni-adjusted, 6 comparisons)"
+    )
   ) +
   
   # Theme
