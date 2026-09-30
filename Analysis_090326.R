@@ -142,6 +142,18 @@ kd_df %>%
 kd_coefs <- as.data.frame(coef(summary(kd_model)))
 kd_ci <- confint(kd_model, parm = "beta_", method = "Wald")
 
+# Build contrast labels from the factor levels in proper case, e.g. "Season" -> "Wet vs Dry"
+make_contrasts <- function(var) {
+  lv <- levels(kd_site[[var]])
+  lv_label <- tools::toTitleCase(tolower(lv))
+  setNames(paste(lv_label[-1], "vs", lv_label[1]), paste0(var, lv[-1]))
+}
+contrast_lookup <- c(
+  make_contrasts("Land_use"),
+  make_contrasts("Season"),
+  make_contrasts("Treatment")
+)
+
 forest_df <- data.frame(
   term = rownames(kd_coefs),
   estimate = kd_coefs[, "Estimate"],
@@ -163,9 +175,15 @@ forest_df <- data.frame(
       ),
       levels = c("Main effect", "Two-way interaction", "Three-way interaction")
     ),
-    # Readable labels, e.g. "Land_usePasture:SeasonWET" -> "Pasture × WET"
-    label = gsub("Land_use|Season|Treatment", "", term),
-    label = gsub(":", " \u00d7 ", label),
+    # Main effects: "Wet vs Dry"; interactions: "Pasture vs Wet", "Urban vs Wet vs Riparian"
+    label = unname(sapply(strsplit(term, ":"), function(x) {
+      if (length(x) == 1) {
+        contrast_lookup[x]
+      } else {
+        lv <- gsub("^(Land_use|Season|Treatment)", "", x)
+        paste(tools::toTitleCase(tolower(lv)), collapse = " vs ")
+      }
+    })),
     # Keep model order from top to bottom
     label = factor(label, levels = rev(unique(label)))
   )
@@ -174,10 +192,10 @@ p_forest <- ggplot(forest_df,
                    aes(x = estimate,
                        y = label,
                        color = Significant)) +
-
+  
   # Zero reference line
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
-
+  
   # Confidence intervals
   geom_errorbar(
     aes(xmin = conf.low,
@@ -185,41 +203,41 @@ p_forest <- ggplot(forest_df,
     width = 0.2,
     linewidth = 0.7
   ) +
-
+  
   # Point estimates
   geom_point(size = 3) +
-
+  
   # Group terms by effect type
   facet_grid(
     Effect_type ~ .,
     scales = "free_y",
     space = "free_y"
   ) +
-
+  
   # Colors
   scale_color_manual(
     values = c(
-      "95% CI excludes 0" = "black",
-      "95% CI includes 0" = "grey60"
+      "95% CI excludes 0" = "#D7191C",
+      "95% CI includes 0" = "#8EC5E8"
     )
   ) +
-
+  
   # Labels
   labs(
     x = "Estimate (log kd) ± 95% CI",
     y = NULL,
     color = NULL,
-    caption = "Reference levels: Forest, DRY, Instream"
+    caption = "Main effects are at the reference levels (Forest, Dry, Instream)"
   ) +
-
+  
   # Theme
   theme_bw(base_size = 12) +
-
+  
   theme(
     legend.position = "bottom",
     panel.grid.major = element_line(color = "grey90"),
     panel.grid.minor = element_blank(),
-
+    
     # Facet labels
     strip.background = element_rect(
       fill = "white",
@@ -239,4 +257,4 @@ forest_df %>%
     ratio.low = exp(conf.low),
     ratio.high = exp(conf.high)
   ) %>%
-  select(term, estimate, conf.low, conf.high, ratio, ratio.low, ratio.high, p.value)
+  select(label, estimate, conf.low, conf.high, ratio, ratio.low, ratio.high, p.value)
