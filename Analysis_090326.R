@@ -175,13 +175,13 @@ forest_df <- data.frame(
       ),
       levels = c("Main effect", "Two-way interaction", "Three-way interaction")
     ),
-    # Main effects: "Wet vs Dry"; interactions: "Pasture vs Wet", "Urban vs Wet vs Riparian"
+    # Main effects: "Wet vs Dry"; interactions: "Pasture × Wet", "Urban × Wet × Riparian"
     label = unname(sapply(strsplit(term, ":"), function(x) {
       if (length(x) == 1) {
         contrast_lookup[x]
       } else {
         lv <- gsub("^(Land_use|Season|Treatment)", "", x)
-        paste(tools::toTitleCase(tolower(lv)), collapse = " vs ")
+        paste(tools::toTitleCase(tolower(lv)), collapse = " \u00d7 ")
       }
     })),
     # Keep model order from top to bottom
