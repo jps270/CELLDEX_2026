@@ -252,6 +252,16 @@ p_forest <- ggplot(forest_df,
     strip.text.y = element_text(angle = 0)
   );p_forest
 
+# Save forest plot
+ggsave(
+  "kd_forest_plot.png",
+  plot = p_forest,
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
 # Estimates are on the log scale; exp(estimate) gives the
 # multiplicative change in kd relative to the reference
 forest_df %>%
