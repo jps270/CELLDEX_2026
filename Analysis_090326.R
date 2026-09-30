@@ -276,6 +276,93 @@ ggsave(
   dpi = 300
 )
 
+# Same forest plot on the log(kd) scale (model estimates, not back-transformed)
+p_forest_log <- ggplot(forest_df,
+                       aes(x = estimate,
+                           y = label,
+                           color = Significant)) +
+  
+  # No-effect reference line (estimate = 0)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  
+  # 95% confidence intervals (thin whiskers)
+  geom_errorbar(
+    aes(xmin = conf.low,
+        xmax = conf.high),
+    width = 0.2,
+    linewidth = 0.7
+  ) +
+  
+  # 50% confidence intervals (thick inner band)
+  geom_errorbar(
+    aes(xmin = conf.low50,
+        xmax = conf.high50),
+    width = 0,
+    linewidth = 2.5
+  ) +
+  
+  # Point estimates
+  geom_point(size = 3) +
+  
+  # Group terms by effect type
+  facet_grid(
+    Effect_type ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  
+  # Colors (same groups as above; on this scale the cutoff is 0)
+  scale_color_manual(
+    values = c(
+      "95% CI excludes 1" = "#D7191C",
+      "95% CI includes 1" = "#8EC5E8"
+    ),
+    labels = c(
+      "95% CI excludes 1" = "95% CI excludes 0",
+      "95% CI includes 1" = "95% CI includes 0"
+    )
+  ) +
+  
+  # Labels
+  labs(
+    x = "Estimate (log kd)",
+    y = NULL,
+    color = NULL,
+    caption = paste0(
+      "Thick bars: 50% CI; thin whiskers: 95% CI\n",
+      "Main effects are at the reference levels (Forest, Dry, Instream)"
+    )
+  ) +
+  
+  # Theme
+  theme_bw(base_size = 12) +
+  
+  theme(
+    legend.position = "bottom",
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    
+    # Facet labels
+    strip.background = element_rect(
+      fill = "white",
+      color = "black"
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    strip.text.y = element_text(angle = 0)
+  );p_forest_log
+
+# Save log-scale forest plot
+ggsave(
+  "kd_forest_plot_log.png",
+  plot = p_forest_log,
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
 # Estimates are on the log scale; exp(estimate) gives the
 # multiplicative change in kd relative to the reference
 forest_df %>%
