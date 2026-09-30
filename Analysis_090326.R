@@ -164,8 +164,8 @@ forest_df <- data.frame(
   mutate(
     # p-values are only present when lmerTest is loaded
     p.value = if ("Pr(>|t|)" %in% names(kd_coefs)) kd_coefs[term, "Pr(>|t|)"] else NA_real_,
-    # Significant if the 95% CI excludes zero
-    Significant = ifelse(conf.low > 0 | conf.high < 0, "95% CI excludes 0", "95% CI includes 0"),
+    # Significant if the 95% CI excludes zero on the log scale (excludes 1 as a ratio)
+    Significant = ifelse(conf.low > 0 | conf.high < 0, "95% CI excludes 1", "95% CI includes 1"),
     # Main effect, 2-way, or 3-way interaction
     Effect_type = factor(
       case_when(
@@ -189,17 +189,17 @@ forest_df <- data.frame(
   )
 
 p_forest <- ggplot(forest_df,
-                   aes(x = estimate,
+                   aes(x = exp(estimate),
                        y = label,
                        color = Significant)) +
   
-  # Zero reference line
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  # No-effect reference line (ratio = 1)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
   
   # Confidence intervals
   geom_errorbar(
-    aes(xmin = conf.low,
-        xmax = conf.high),
+    aes(xmin = exp(conf.low),
+        xmax = exp(conf.high)),
     width = 0.2,
     linewidth = 0.7
   ) +
@@ -214,17 +214,20 @@ p_forest <- ggplot(forest_df,
     space = "free_y"
   ) +
   
+  # Log scale so increases and decreases are symmetric around 1
+  scale_x_log10() +
+  
   # Colors
   scale_color_manual(
     values = c(
-      "95% CI excludes 0" = "#D7191C",
-      "95% CI includes 0" = "#8EC5E8"
+      "95% CI excludes 1" = "#D7191C",
+      "95% CI includes 1" = "#8EC5E8"
     )
   ) +
   
   # Labels
   labs(
-    x = "Estimate (log kd) ± 95% CI",
+    x = "Multiplicative effect on kd (exp(estimate), 95% CI)",
     y = NULL,
     color = NULL,
     caption = "Main effects are at the reference levels (Forest, Dry, Instream)"
