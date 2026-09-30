@@ -31,7 +31,7 @@ p <- ggplot(kd_summary,
   geom_line(linewidth = 1) +
   
   # Points
-  geom_point(size = 3) +
+  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
   
   # Error bars
   geom_errorbar(
@@ -216,7 +216,7 @@ p_forest <- ggplot(forest_df,
   ) +
   
   # Point estimates
-  geom_point(size = 3) +
+  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
   
   # Group terms by effect type
   facet_grid(
@@ -302,7 +302,7 @@ p_forest_log <- ggplot(forest_df,
   ) +
   
   # Point estimates
-  geom_point(size = 3) +
+  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
   
   # Group terms by effect type
   facet_grid(
