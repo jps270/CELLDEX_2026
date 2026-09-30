@@ -138,9 +138,10 @@ kd_df %>%
   count(Land_use)
 
 #Forest plot of mixed model results------------------
-# Fixed-effect estimates with 95% Wald confidence intervals
+# Fixed-effect estimates with 95% and 50% Wald confidence intervals
 kd_coefs <- as.data.frame(coef(summary(kd_model)))
 kd_ci <- confint(kd_model, parm = "beta_", method = "Wald")
+kd_ci50 <- confint(kd_model, parm = "beta_", method = "Wald", level = 0.50)
 
 # Build contrast labels from the factor levels in proper case, e.g. "Season" -> "Wet vs Dry"
 make_contrasts <- function(var) {
@@ -158,7 +159,9 @@ forest_df <- data.frame(
   term = rownames(kd_coefs),
   estimate = kd_coefs[, "Estimate"],
   conf.low = kd_ci[rownames(kd_coefs), 1],
-  conf.high = kd_ci[rownames(kd_coefs), 2]
+  conf.high = kd_ci[rownames(kd_coefs), 2],
+  conf.low50 = kd_ci50[rownames(kd_coefs), 1],
+  conf.high50 = kd_ci50[rownames(kd_coefs), 2]
 ) %>%
   filter(term != "(Intercept)") %>%
   mutate(
@@ -196,12 +199,20 @@ p_forest <- ggplot(forest_df,
   # No-effect reference line (ratio = 1)
   geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
   
-  # Confidence intervals
+  # 95% confidence intervals (thin whiskers)
   geom_errorbar(
     aes(xmin = exp(conf.low),
         xmax = exp(conf.high)),
     width = 0.2,
     linewidth = 0.7
+  ) +
+  
+  # 50% confidence intervals (thick inner band)
+  geom_errorbar(
+    aes(xmin = exp(conf.low50),
+        xmax = exp(conf.high50)),
+    width = 0,
+    linewidth = 2.5
   ) +
   
   # Point estimates
@@ -227,10 +238,13 @@ p_forest <- ggplot(forest_df,
   
   # Labels
   labs(
-    x = "Multiplicative effect on kd (exp(estimate), 95% CI)",
+    x = "Multiplicative effect on kd (exp(estimate))",
     y = NULL,
     color = NULL,
-    caption = "Main effects are at the reference levels (Forest, Dry, Instream)"
+    caption = paste0(
+      "Thick bars: 50% CI; thin whiskers: 95% CI\n",
+      "Main effects are at the reference levels (Forest, Dry, Instream)"
+    )
   ) +
   
   # Theme
