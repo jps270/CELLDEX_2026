@@ -368,14 +368,18 @@ ggsave(
 kd_emm <- emmeans::emmeans(kd_model, ~ Season | Land_use * Treatment)
 season_eff <- emmeans::contrast(kd_emm, method = "revpairwise")  # WET - DRY
 
-season_ci <- as.data.frame(confint(season_eff, level = 0.95))
-season_ci50 <- as.data.frame(confint(season_eff, level = 0.50))
+# 95% CIs and p-values Bonferroni-adjusted across all 6 land use x position groups
+# (by = NULL makes the 6 contrasts one family; otherwise each group is its own family of 1)
+season_ci <- as.data.frame(summary(season_eff, by = NULL, adjust = "bonferroni",
+                                   infer = c(TRUE, TRUE), level = 0.95))
+# 50% band left unadjusted
+season_ci50 <- as.data.frame(confint(season_eff, by = NULL, adjust = "none", level = 0.50))
 
 season_df <- season_ci %>%
   mutate(
     conf.low50 = season_ci50$lower.CL,
     conf.high50 = season_ci50$upper.CL,
-    # Significant if the 95% CI excludes zero on the log scale (excludes 1 as a ratio)
+    # Significant if the adjusted 95% CI excludes zero on the log scale (excludes 1 as a ratio)
     Significant = ifelse(lower.CL > 0 | upper.CL < 0, "95% CI excludes 1", "95% CI includes 1"),
     # Forest at the top
     Land_use = factor(Land_use, levels = rev(levels(kd_site$Land_use)))
@@ -429,7 +433,7 @@ p_season <- ggplot(season_df,
     x = "Wet vs Dry effect on kd (ratio)",
     y = NULL,
     color = NULL,
-    caption = "Thick bars: 50% CI; thin whiskers: 95% CI"
+    caption = "Thick bars: 50% CI (unadjusted); thin whiskers: 95% CI (Bonferroni-adjusted, 6 comparisons)"
   ) +
   
   # Theme
@@ -468,7 +472,7 @@ season_df %>%
     ratio.low = exp(lower.CL),
     ratio.high = exp(upper.CL)
   ) %>%
-  select(Treatment, Land_use, estimate, lower.CL, upper.CL, ratio, ratio.low, ratio.high)
+  select(Treatment, Land_use, estimate, lower.CL, upper.CL, ratio, ratio.low, ratio.high, p.value)
 
 # Estimates are on the log scale; exp(estimate) gives the
 # multiplicative change in kd relative to the reference
