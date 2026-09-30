@@ -363,6 +363,113 @@ ggsave(
   dpi = 300
 )
 
+#Simple effects forest plot (emmeans)------------------
+# Wet vs Dry effect within each land use and strip position
+kd_emm <- emmeans::emmeans(kd_model, ~ Season | Land_use * Treatment)
+season_eff <- emmeans::contrast(kd_emm, method = "revpairwise")  # WET - DRY
+
+season_ci <- as.data.frame(confint(season_eff, level = 0.95))
+season_ci50 <- as.data.frame(confint(season_eff, level = 0.50))
+
+season_df <- season_ci %>%
+  mutate(
+    conf.low50 = season_ci50$lower.CL,
+    conf.high50 = season_ci50$upper.CL,
+    # Significant if the 95% CI excludes zero on the log scale (excludes 1 as a ratio)
+    Significant = ifelse(lower.CL > 0 | upper.CL < 0, "95% CI excludes 1", "95% CI includes 1"),
+    # Forest at the top
+    Land_use = factor(Land_use, levels = rev(levels(kd_site$Land_use)))
+  )
+
+p_season <- ggplot(season_df,
+                   aes(x = exp(estimate),
+                       y = Land_use,
+                       color = Significant)) +
+  
+  # No-effect reference line (ratio = 1)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  
+  # 95% confidence intervals (thin whiskers)
+  geom_errorbar(
+    aes(xmin = exp(lower.CL),
+        xmax = exp(upper.CL)),
+    width = 0.2,
+    linewidth = 0.7
+  ) +
+  
+  # 50% confidence intervals (thick inner band)
+  geom_errorbar(
+    aes(xmin = exp(conf.low50),
+        xmax = exp(conf.high50)),
+    width = 0,
+    linewidth = 2.5
+  ) +
+  
+  # Point estimates
+  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
+  
+  # Separate Instream and Riparian rows
+  facet_grid(
+    Treatment ~ .
+  ) +
+  
+  # Log scale so increases and decreases are symmetric around 1
+  scale_x_log10() +
+  
+  # Colors
+  scale_color_manual(
+    values = c(
+      "95% CI excludes 1" = "#D7191C",
+      "95% CI includes 1" = "#8EC5E8"
+    )
+  ) +
+  
+  # Labels
+  labs(
+    x = "Wet vs Dry effect on kd (ratio)",
+    y = NULL,
+    color = NULL,
+    caption = "Thick bars: 50% CI; thin whiskers: 95% CI"
+  ) +
+  
+  # Theme
+  theme_bw(base_size = 12) +
+  
+  theme(
+    legend.position = "bottom",
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    
+    # Facet labels
+    strip.background = element_rect(
+      fill = "white",
+      color = "black"
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    strip.text.y = element_text(angle = 0)
+  );p_season
+
+# Save simple effects forest plot
+ggsave(
+  "kd_season_simple_effects.png",
+  plot = p_season,
+  width = 7,
+  height = 4,
+  units = "in",
+  dpi = 300
+)
+
+# Wet vs Dry simple effects as ratios
+season_df %>%
+  mutate(
+    ratio = exp(estimate),
+    ratio.low = exp(lower.CL),
+    ratio.high = exp(upper.CL)
+  ) %>%
+  select(Treatment, Land_use, estimate, lower.CL, upper.CL, ratio, ratio.low, ratio.high)
+
 # Estimates are on the log scale; exp(estimate) gives the
 # multiplicative change in kd relative to the reference
 forest_df %>%
