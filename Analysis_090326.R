@@ -477,6 +477,124 @@ season_df %>%
   ) %>%
   select(Treatment, Land_use, estimate, lower.CL, upper.CL, ratio, ratio.low, ratio.high, p.value)
 
+#Land use simple effects forest plot (emmeans)------------------
+# Pasture vs Forest and Urban vs Forest within each season and strip position
+landuse_emm <- emmeans::emmeans(kd_model, ~ Land_use | Season * Treatment)
+landuse_eff <- emmeans::contrast(landuse_emm, method = "trt.vs.ctrl")  # Pasture - Forest, Urban - Forest
+
+# 95% CIs and p-values Bonferroni-adjusted across all 8 contrasts
+# (2 land use contrasts x 4 season/position groups; by = NULL makes them one family)
+landuse_ci <- as.data.frame(summary(landuse_eff, by = NULL, adjust = "bonferroni",
+                                    infer = c(TRUE, TRUE), level = 0.95))
+# 50% band left unadjusted
+landuse_ci50 <- as.data.frame(confint(landuse_eff, by = NULL, adjust = "none", level = 0.50))
+
+landuse_df <- landuse_ci %>%
+  mutate(
+    conf.low50 = landuse_ci50$lower.CL,
+    conf.high50 = landuse_ci50$upper.CL,
+    # Significant if the adjusted 95% CI excludes zero on the log scale (excludes 1 as a ratio)
+    Significant = ifelse(lower.CL > 0 | upper.CL < 0, "95% CI excludes 1", "95% CI includes 1"),
+    # "Pasture - Forest" -> "Pasture vs Forest", Pasture at the top
+    contrast = factor(gsub(" - ", " vs ", contrast),
+                      levels = c("Urban vs Forest", "Pasture vs Forest")),
+    # Proper case season labels for the facets
+    Season = factor(tools::toTitleCase(tolower(as.character(Season))),
+                    levels = c("Dry", "Wet"))
+  )
+
+p_landuse <- ggplot(landuse_df,
+                    aes(x = exp(estimate),
+                        y = contrast,
+                        color = Significant)) +
+  
+  # No-effect reference line (ratio = 1)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  
+  # 95% confidence intervals (thin whiskers)
+  geom_errorbar(
+    aes(xmin = exp(lower.CL),
+        xmax = exp(upper.CL)),
+    width = 0.2,
+    linewidth = 0.7
+  ) +
+  
+  # 50% confidence intervals (thick inner band)
+  geom_errorbar(
+    aes(xmin = exp(conf.low50),
+        xmax = exp(conf.high50)),
+    width = 0,
+    linewidth = 2.5
+  ) +
+  
+  # Point estimates
+  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
+  
+  # Season rows, Instream and Riparian columns
+  facet_grid(
+    Season ~ Treatment
+  ) +
+  
+  # Log scale so increases and decreases are symmetric around 1
+  scale_x_log10() +
+  
+  # Colors
+  scale_color_manual(
+    values = c(
+      "95% CI excludes 1" = "#D7191C",
+      "95% CI includes 1" = "#8EC5E8"
+    )
+  ) +
+  
+  # Labels
+  labs(
+    x = "Land use effect on kd (ratio)",
+    y = NULL,
+    color = NULL,
+    caption = paste0(
+      "Thick bars: 50% CI (unadjusted)\n",
+      "Thin whiskers: 95% CI (Bonferroni-adjusted, 8 comparisons)"
+    )
+  ) +
+  
+  # Theme
+  theme_bw(base_size = 12) +
+  
+  theme(
+    legend.position = "bottom",
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    
+    # Facet labels
+    strip.background = element_rect(
+      fill = "white",
+      color = "black"
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    strip.text.y = element_text(angle = 0)
+  );p_landuse
+
+# Save land use simple effects forest plot
+ggsave(
+  "kd_landuse_simple_effects.png",
+  plot = p_landuse,
+  width = 8,
+  height = 4.5,
+  units = "in",
+  dpi = 300
+)
+
+# Land use simple effects as ratios
+landuse_df %>%
+  mutate(
+    ratio = exp(estimate),
+    ratio.low = exp(lower.CL),
+    ratio.high = exp(upper.CL)
+  ) %>%
+  select(Season, Treatment, contrast, estimate, lower.CL, upper.CL, ratio, ratio.low, ratio.high, p.value)
+
 # Estimates are on the log scale; exp(estimate) gives the
 # multiplicative change in kd relative to the reference
 forest_df %>%
