@@ -31,7 +31,7 @@ p <- ggplot(kd_summary,
   geom_line(linewidth = 1) +
   
   # Points
-  geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2) +
+  geom_point(size = 3) +
   
   # Error bars
   geom_errorbar(
